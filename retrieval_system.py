@@ -1,0 +1,278 @@
+"""
+病历相似度检索系统
+新病例入库时，快速找到相似度≥阈值的已记录病例
+"""
+
+import numpy as np
+from typing import List, Dict, Optional, Tuple
+import pickle
+import os
+
+from record_parser import MedicalRecordParser, MedicalRecord
+from feature_extractor import FeatureExtractor
+from similarity_index import create_index, VectorIndex
+
+
+class MedicalRecordSimilaritySystem:
+    """
+    病历相似度检索系统
+
+    支持功能:
+    - 新病例入库 (add_record)
+    - 相似病例检索 (search)
+    - 检索+自动入库 (search_and_add)
+    """
+
+    def __init__(self,
+                 similarity_threshold: float = 0.7,
+                 feature_dim: int = 600,
+                 index_backend: str = "sklearn",
+                 index_path: Optional[str] = None):
+        """
+        Args:
+            similarity_threshold: 相似度阈值，低于此值的病例不返回
+            feature_dim: 特征向量维度
+            index_backend: 索引后端 "sklearn" 或 "faiss"
+            index_path: 索引持久化路径
+        """
+        self.threshold = similarity_threshold
+        self.feature_dim = feature_dim
+        self.index_path = index_path
+
+        # 组件初始化
+        self.parser = MedicalRecordParser()
+        self.extractor = FeatureExtractor()
+        self.index: VectorIndex = create_index(feature_dim, index_backend)
+
+        # 病例存储: id -> {text, features, parsed_record}
+        self.records: Dict[str, Dict] = {}
+        self.record_order: List[str] = []  # 保持插入顺序
+        self.record_count = 0
+
+        # 尝试加载已有索引
+        if index_path and os.path.exists(index_path + ".idx"):
+            self._load_index()
+
+    def add_record(self, record_id: str, text: str) -> None:
+        """
+        添加病例到检索系统
+
+        Args:
+            record_id: 病例唯一ID
+            text: 病历文本
+        """
+        # 解析病历
+        parsed_record = self.parser.parse(text)
+
+        # 提取特征
+        features = self.extractor.extract(parsed_record)
+
+        # 添加到索引
+        self.index.add(features.reshape(1, -1))
+
+        # 存储病例数据
+        self.records[record_id] = {
+            'text': text,
+            'features': features,
+            'parsed_record': parsed_record
+        }
+        self.record_order.append(record_id)
+
+        # 持久化索引
+        if self.index_path:
+            self._save_index()
+
+    def search(self,
+               query_text: str,
+               top_k: int = 10,
+               auto_add: bool = False,
+               record_id: Optional[str] = None) -> List[Dict]:
+        """
+        检索相似病例
+
+        Args:
+            query_text: 待查询病历文本
+            top_k: 返回前K个最相似病例
+            auto_add: 是否自动入库
+            record_id: 病例ID（auto_add=True时必填）
+
+        Returns:
+            [{'id': xxx, 'similarity': 0.85, 'text': xxx}, ...]
+        """
+        if auto_add:
+            return self.search_and_add(query_text, record_id, top_k)
+
+        # 仅检索（不入库）
+        return self._search_only(query_text, top_k)
+
+    def _search_only(self, query_text: str, top_k: int) -> List[Dict]:
+        """仅检索，不入库"""
+        if not self.records:
+            return []
+
+        # 解析并提取特征
+        query_record = self.parser.parse(query_text)
+        query_features = self.extractor.extract(query_record).reshape(1, -1)
+
+        # 检索
+        distances, indices = self.index.search(query_features, top_k)
+
+        # 收集结果
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx < 0 or idx >= len(self.record_order):
+                continue
+
+            similarity = self._distance_to_similarity(dist)
+            if similarity >= self.threshold:
+                record_id = self.record_order[idx]
+                results.append({
+                    'id': record_id,
+                    'similarity': round(similarity, 4),
+                    'text': self.records[record_id]['text'][:200] + "...",  # 截断
+                    'full_text': self.records[record_id]['text']
+                })
+
+        # 按相似度排序
+        results.sort(key=lambda x: x['similarity'], reverse=True)
+
+        return results
+
+    def search_and_add(self,
+                       query_text: str,
+                       record_id: Optional[str] = None,
+                       top_k: int = 10) -> List[Dict]:
+        """
+        检索相似病例 + 自动入库
+
+        Args:
+            query_text: 待查询病历文本
+            record_id: 病例ID（若不提供则自动生成）
+            top_k: 返回前K个最相似病例
+
+        Returns:
+            [{'id': xxx, 'similarity': 0.85, 'text': xxx}, ...]
+        """
+        # 1. 先检索（基于当前底库，不含新病例）
+        results = self._search_only(query_text, top_k)
+
+        # 2. 自动入库
+        if record_id is None:
+            record_id = f"record_{self.record_count}"
+        self.record_count += 1
+
+        self.add_record(record_id, query_text)
+
+        return results
+
+    def _distance_to_similarity(self, distance: float) -> float:
+        """
+        将距离转换为相似度
+        使用余弦相似度: similarity = 1 - distance
+        """
+        return max(0.0, 1.0 - distance)
+
+    def _save_index(self) -> None:
+        """保存索引和元数据"""
+        if not self.index_path:
+            return
+
+        # 保存向量索引
+        self.index.save(self.index_path + ".idx")
+
+        # 保存元数据
+        metadata = {
+            'records': {k: {'text': v['text']} for k, v in self.records.items()},
+            'record_order': self.record_order,
+            'threshold': self.threshold,
+            'feature_dim': self.feature_dim,
+            'record_count': self.record_count
+        }
+        with open(self.index_path + ".meta", 'wb') as f:
+            pickle.dump(metadata, f)
+
+    def _load_index(self) -> None:
+        """加载索引和元数据"""
+        if not self.index_path:
+            return
+
+        try:
+            # 加载元数据
+            with open(self.index_path + ".meta", 'rb') as f:
+                metadata = pickle.load(f)
+
+            self.records = metadata['records']
+            self.record_order = metadata['record_order']
+            self.threshold = metadata.get('threshold', 0.7)
+            self.feature_dim = metadata.get('feature_dim', 600)
+            self.record_count = metadata.get('record_count', len(self.record_order))
+
+            # 重新解析病历
+            for record_id, data in self.records.items():
+                parsed = self.parser.parse(data['text'])
+                features = self.extractor.extract(parsed)
+                data['features'] = features
+                data['parsed_record'] = parsed
+
+            # 加载向量索引
+            from similarity_index import create_index
+            self.index = create_index(self.feature_dim, "sklearn")
+            self.index.load(self.index_path + ".idx")
+
+            print(f"Loaded {len(self.records)} records from index")
+        except Exception as e:
+            print(f"Failed to load index: {e}")
+
+    def get_stats(self) -> Dict:
+        """获取系统统计信息"""
+        return {
+            'total_records': len(self.records),
+            'threshold': self.threshold,
+            'feature_dim': self.feature_dim,
+            'index_type': type(self.index).__name__
+        }
+
+    def set_threshold(self, threshold: float) -> None:
+        """设置相似度阈值"""
+        self.threshold = threshold
+
+
+def create_system(data_dir: str = "./data",
+                  threshold: float = 0.7) -> MedicalRecordSimilaritySystem:
+    """
+    工厂函数：创建检索系统
+
+    Args:
+        data_dir: 数据存储目录
+        threshold: 相似度阈值
+
+    Returns:
+        MedicalRecordSimilaritySystem 实例
+    """
+    os.makedirs(data_dir, exist_ok=True)
+    index_path = os.path.join(data_dir, "similarity_index")
+
+    return MedicalRecordSimilaritySystem(
+        similarity_threshold=threshold,
+        index_path=index_path
+    )
+
+
+if __name__ == "__main__":
+    # 测试
+    system = create_system(data_dir="./test_data", threshold=0.6)
+
+    # 添加测试病例
+    with open("病历.txt", "r", encoding="utf-8") as f:
+        text = f.read()
+
+    system.add_record("病例001", text)
+
+    # 检索
+    results = system.search(text, top_k=5)
+
+    print(f"\n=== 检索结果 (阈值={system.threshold}) ===")
+    for r in results:
+        print(f"ID: {r['id']}, 相似度: {r['similarity']}")
+
+    print(f"\n系统统计: {system.get_stats()}")
