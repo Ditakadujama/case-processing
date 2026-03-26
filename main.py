@@ -125,8 +125,8 @@ def demo_search_similar():
     query_name = list(records.keys())[0]
     query_text = records[query_name]
 
-    # 截取部分文本作为模拟查询
-    query_for_search = query_text[:min(3000, len(query_text))]
+    # 使用完整文本查询（与入库时一致）
+    query_for_search = query_text
 
     print(f"    查询文件: {query_name}")
     print(f"    查询长度: {len(query_for_search)} 字符")
@@ -201,17 +201,6 @@ def main():
 
     # 3. 检索演示
     demo_search_similar()
-
-    print("\n演示完成！")
-    print("\n使用方法:")
-    print("  1. 将病历 .txt 文件放入 ./data/records/ 目录")
-    print("  2. 运行 python main.py")
-    print("\n或在代码中使用:")
-    print("  from retrieval_system import create_system")
-    print("  system = create_system(data_dir='./data', threshold=0.7)")
-    print("  records = scan_medical_records('./data/records')")
-    print("  for filename, text in records.items():")
-    print("      system.search_and_add(text, record_id=filename)")
 
 
 if __name__ == "__main__":

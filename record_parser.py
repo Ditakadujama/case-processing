@@ -59,9 +59,9 @@ class MedicalRecordParser:
     """病历解析器"""
 
     def __init__(self):
-        # 患者信息正则
+        # 患者信息正则 - 匹配 "姓名：xxx，性别：x，年龄：xx岁"
         self.patient_pattern = re.compile(
-            r"姓名[：:]([^\s，,]+)[，,]\s*性别[：:]([男女])\s*,?\s*年龄[：:](\d+)岁"
+            r"姓名[：:]([^\s，,]+)[，,]\s*性别[：:]([男女])[，,\s]+年龄[：:](\d+)岁"
         )
         self.height_weight_pattern = re.compile(
             r"身高[：:](\d+(?:\.\d+)?)cm[，,]\s*体重[：:](\d+(?:\.\d+)?)kg"
@@ -174,35 +174,59 @@ class MedicalRecordParser:
     def extract_medications(self, text: str) -> List[Medication]:
         """提取用药信息"""
         medications = []
+        seen_drugs = set()  # 避免重复
 
         # 提取医嘱部分
         yizhu_section = self._extract_section(text, "医嘱")
         if not yizhu_section:
             return medications
 
-        # 常见药物关键词
+        # 常见药物关键词（扩大列表）
         drug_keywords = [
             "瑞芬太尼", "丙泊酚", "呋塞米", "多巴酚丁胺", "肾上腺素",
-            "青霉素", "哌拉西林", "头孢", "甘油", "去乙酰毛花苷",
-            "艾司奥美拉唑", "奥美拉唑", "利多卡因", "肝素", "葡萄糖酸钙"
+            "青霉素", "哌拉西林", "头孢", "去乙酰毛花苷",
+            "艾司奥美拉唑", "奥美拉唑", "利多卡因", "肝素", "葡萄糖酸钙",
+            "氯化钠", "葡萄糖", "林格", "甘油", "开塞露", "吲哚美辛",
+            "硝酸甘油", "氨溴索", "氨茶碱", "阿司匹林", "氯吡格雷",
+            "甲泼尼龙", "地塞米松", "头孢曲松", "头孢他啶", "美罗培南",
+            "万古霉素", "替考拉宁", "奥司他韦", "阿奇霉素", "左氧氟沙星"
         ]
 
         for keyword in drug_keywords:
-            if keyword in yizhu_section:
-                # 提取剂量
-                dosage_match = re.search(rf"{keyword}[^\d]*(\d+(?:\.\d+)?(?:mg|g|ml|万iu)?)", yizhu_section)
-                dosage = dosage_match.group(1) if dosage_match else ""
+            if keyword in yizhu_section and keyword not in seen_drugs:
+                seen_drugs.add(keyword)
+
+                # 提取剂量 - 查找关键词后面的数字+单位
+                dosage = ""
+                route = ""
+
+                # 查找剂量模式
+                dosage_match = re.search(
+                    rf"{keyword}[^0-9]*?(\d+(?:\.\d+)?)\s*(?:g|mg|ml|万|iu|ug)?",
+                    yizhu_section
+                )
+                if dosage_match:
+                    dosage = dosage_match.group(1)
 
                 # 提取给药途径
-                route = ""
-                if "静滴" in yizhu_section:
-                    route = "静滴"
-                elif "泵入" in yizhu_section:
+                # 在关键词附近查找途径
+                idx = yizhu_section.find(keyword)
+                nearby_text = yizhu_section[idx:idx+100] if idx >= 0 else yizhu_section[:100]
+
+                if "泵入" in nearby_text:
                     route = "泵入"
-                elif "静推" in yizhu_section:
+                elif "静滴" in nearby_text:
+                    route = "静滴"
+                elif "静推" in nearby_text:
                     route = "静推"
-                elif "口服" in yizhu_section:
+                elif "口服" in nearby_text:
                     route = "口服"
+                elif "皮试" in nearby_text:
+                    route = "皮试"
+                elif "肛入" in nearby_text:
+                    route = "肛入"
+                elif "外用" in nearby_text:
+                    route = "外用"
 
                 medications.append(Medication(
                     name=keyword,
@@ -240,9 +264,10 @@ class MedicalRecordParser:
 
     def _extract_section(self, text: str, section_name: str) -> Optional[str]:
         """提取病历的某个章节"""
-        pattern = rf"###[^'#]*?{section_name}[^'\n]*?\n(.*?)(?=###|\Z)"
+        # 支持中文冒号和英文冒号
+        pattern = rf"###{section_name}[：:]?(.*?)(?=###[^\n]|\Z)"
         match = re.search(pattern, text, re.DOTALL)
-        return match.group(1) if match else None
+        return match.group(1).strip() if match else None
 
 
 if __name__ == "__main__":

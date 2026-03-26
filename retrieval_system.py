@@ -3,7 +3,6 @@
 新病例入库时，快速找到相似度≥阈值的已记录病例
 """
 
-import numpy as np
 from typing import List, Dict, Optional, Tuple
 import pickle
 import os
@@ -25,33 +24,46 @@ class MedicalRecordSimilaritySystem:
 
     def __init__(self,
                  similarity_threshold: float = 0.7,
-                 feature_dim: int = 600,
+                 feature_dim: int = None,
                  index_backend: str = "sklearn",
                  index_path: Optional[str] = None):
         """
         Args:
             similarity_threshold: 相似度阈值，低于此值的病例不返回
-            feature_dim: 特征向量维度
+            feature_dim: 特征向量维度（自动从extractor获取）
             index_backend: 索引后端 "sklearn" 或 "faiss"
             index_path: 索引持久化路径
         """
         self.threshold = similarity_threshold
-        self.feature_dim = feature_dim
         self.index_path = index_path
 
         # 组件初始化
         self.parser = MedicalRecordParser()
         self.extractor = FeatureExtractor()
-        self.index: VectorIndex = create_index(feature_dim, index_backend)
+        # 自动获取特征维度
+        self.feature_dim = feature_dim or self.extractor.total_dim
+        self.index: VectorIndex = create_index(self.feature_dim, index_backend)
 
         # 病例存储: id -> {text, features, parsed_record}
         self.records: Dict[str, Dict] = {}
         self.record_order: List[str] = []  # 保持插入顺序
         self.record_count = 0
 
+        # TF-IDF 向量器是否已训练
+        self._extractor_fitted = False
+
         # 尝试加载已有索引
         if index_path and os.path.exists(index_path + ".idx"):
             self._load_index()
+        else:
+            # 使用默认词汇表初始化TF-IDF
+            self._init_default_vocabulary()
+
+    def _init_default_vocabulary(self) -> None:
+        """初始化向量提取器"""
+        # 词袋模型不需要训练，直接标记为已就绪
+        self.extractor.fit([])
+        self._extractor_fitted = True
 
     def add_record(self, record_id: str, text: str) -> None:
         """
@@ -64,7 +76,7 @@ class MedicalRecordSimilaritySystem:
         # 解析病历
         parsed_record = self.parser.parse(text)
 
-        # 提取特征
+        # 提取特征（词袋模型不需要训练）
         features = self.extractor.extract(parsed_record)
 
         # 添加到索引
