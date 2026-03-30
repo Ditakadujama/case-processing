@@ -17,6 +17,58 @@ from retrieval_system import create_system, MedicalRecordSimilaritySystem
 from record_parser import MedicalRecordParser
 
 
+def load_xlsx_records(filepath: str) -> dict:
+    """
+    读取 Excel，按 patient_id 分组合并记录
+    保留所有列信息
+
+    Args:
+        filepath: Excel 文件路径
+
+    Returns:
+        {patient_id: 合并后的病例文本}
+    """
+    import pandas as pd
+
+    print(f"读取 Excel 文件: {filepath}")
+    df = pd.read_excel(filepath, sheet_name='Sheet1')
+    print(f"总记录数: {len(df)} 行")
+
+    # 所有需要合并的列
+    columns_to_merge = [
+        'patient_info', 'chief_complaint', 'instrument_test',
+        'checkout', 'examine', 'doctor_advice',
+        'inspection_visit', 'history_illness',
+        'surgery_record', 'monitor', 'operation_record'
+    ]
+
+    records = {}
+    grouped = df.groupby('patient_id')
+
+    print(f"患者数量: {len(grouped)}")
+
+    for patient_id, group in grouped:
+        group = group.sort_values('date')
+        total = len(group)
+        combined_texts = []
+
+        for i, (_, row) in enumerate(group.iterrows(), 1):
+            date = row['date']
+            parts = [f"###就诊记录 {i}/{total} - {date}"]
+
+            for col in columns_to_merge:
+                val = row.get(col)
+                if pd.notna(val) and str(val).strip():
+                    parts.append(f"###{col}: {val}")
+
+            combined_texts.append('\n'.join(parts))
+
+        records[patient_id] = '\n\n'.join(combined_texts)
+
+    print(f"合并后病例数: {len(records)}")
+    return records
+
+
 def scan_medical_records(folder: str) -> dict:
     """
     扫描文件夹，获取所有病历文本
@@ -134,8 +186,12 @@ def demo_search_similar():
     results = system.search(query_for_search, top_k=5)
 
     print(f"\n    找到 {len(results)} 个相似病例:")
-    for r in results:
-        print(f"      - {r['id']}: 相似度 {r['similarity']}")
+    for i, r in enumerate(results, 1):
+        print(f"\n{'='*60}")
+        print(f"  [{i}] {r['id']} (相似度: {r['similarity']})")
+        print(f"{'='*60}")
+        print(r['full_text'])
+        print(f"{'='*60}")
 
     print("\n" + "=" * 60)
 
@@ -185,22 +241,104 @@ def demo_parse_only():
     print("\n" + "=" * 60)
 
 
+def demo_import_xlsx():
+    """从 Excel 导入病例（仅导入，不检索）"""
+    print("=" * 60)
+    print("Excel 导入")
+    print("=" * 60)
+
+    xlsx_file = "patient_info (18).xlsx"
+    if not os.path.exists(xlsx_file):
+        print(f"Excel 文件不存在: {xlsx_file}")
+        return
+
+    # 读取并合并 Excel
+    records = load_xlsx_records(xlsx_file)
+
+    if not records:
+        print("未找到有效病例")
+        return
+
+    # 创建系统
+    system = create_system(data_dir="./data", threshold=0.5)
+
+    print(f"\n开始导入 {len(records)} 个患者病例...")
+
+    for i, (patient_id, text) in enumerate(records.items(), 1):
+        if i % 500 == 0:
+            print(f"  已导入 {i}/{len(records)}...")
+
+        # 仅导入，不检索
+        system.add_record(patient_id, text)
+
+    print(f"\n导入完成！")
+    print(f"底库病例总数: {len(system.records)}")
+    print("\n" + "=" * 60)
+
+
+def demo_search():
+    """检索相似病例（使用已导入的数据）"""
+    print("=" * 60)
+    print("相似病例检索")
+    print("=" * 60)
+
+    # 创建系统（加载已有索引）
+    system = create_system(data_dir="./data", threshold=0.5)
+
+    print(f"底库病例总数: {len(system.records)}")
+
+    if not system.records:
+        print("底库为空，请先运行导入")
+        return
+
+    # 列出前5个患者
+    print("\n底库前5个患者:")
+    for i, pid in enumerate(list(system.records.keys())[:5], 1):
+        print(f"  {i}. {pid}")
+
+    # 用第一个患者测试检索
+    first_pid = list(system.records.keys())[0]
+    query_text = system.records[first_pid]['text']
+
+    print(f"\n使用患者 {first_pid} 进行检索测试...")
+    print(f"查询文本长度: {len(query_text)} 字符")
+
+    results = system.search(query_text, top_k=5)
+
+    print(f"\n找到 {len(results)} 个相似病例:")
+    print("-" * 50)
+    for r in results:
+        print(f"\n患者ID: {r['id']}")
+        print(f"相似度: {r['similarity']}")
+        print(f"内容预览: {r['full_text'][:300]}...")
+        print("-" * 50)
+
+    print("\n" + "=" * 60)
+
+
 def main():
     """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='病历相似度检索系统')
+    parser.add_argument('--mode', choices=['import', 'search'], default='search',
+                        help='import: 导入Excel病例; search: 检索相似病例')
+    args = parser.parse_args()
+
     print("\n")
     print("╔" + "═" * 58 + "╗")
     print("║" + " " * 15 + "病历相似度检索系统" + " " * 22 + "║")
     print("╚" + "═" * 58 + "╝")
     print()
 
-    # 1. 解析演示
-    demo_parse_only()
+    if args.mode == 'import':
+        demo_import_xlsx()
+    else:
+        demo_search()
 
-    # 2. 自动导入演示
-    demo_auto_import()
 
-    # 3. 检索演示
-    demo_search_similar()
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
