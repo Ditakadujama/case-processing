@@ -53,7 +53,7 @@ class MedicalRecordSimilaritySystem:
         self._extractor_fitted = False
 
         # 尝试加载已有索引
-        if index_path and os.path.exists(index_path + ".idx"):
+        if index_path and os.path.exists(index_path + ".npy"):
             self._load_index()
         else:
             # 使用默认词汇表初始化TF-IDF
@@ -190,7 +190,7 @@ class MedicalRecordSimilaritySystem:
             return
 
         # 保存向量索引
-        self.index.save(self.index_path + ".idx")
+        self.index.save(self.index_path)
 
         # 保存元数据
         metadata = {
@@ -229,7 +229,7 @@ class MedicalRecordSimilaritySystem:
             # 加载向量索引
             from similarity_index import create_index
             self.index = create_index(self.feature_dim, "sklearn")
-            self.index.load(self.index_path + ".idx")
+            self.index.load(self.index_path)
 
             print(f"Loaded {len(self.records)} records from index")
         except Exception as e:

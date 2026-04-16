@@ -108,11 +108,11 @@ class SklearnIndex(VectorIndex):
         """保存到文件"""
         if self._vectors:
             all_vectors = np.vstack(self._vectors)
-            np.save(path, all_vectors)
+            np.save(path + ".npy", all_vectors)
 
     def load(self, path: str) -> None:
         """从文件加载"""
-        all_vectors = np.load(path)
+        all_vectors = np.load(path + ".npy")
         self._vectors = [all_vectors]
         self._indexed = False
 

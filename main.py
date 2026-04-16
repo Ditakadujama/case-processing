@@ -264,9 +264,12 @@ def demo_import_xlsx():
 
     print(f"\n开始导入 {len(records)} 个患者病例...")
 
-    for i, (patient_id, text) in enumerate(records.items(), 1):
-        if i % 500 == 0:
-            print(f"  已导入 {i}/{len(records)}...")
+    # 只导入前500个患者
+    items = list(records.items())[:500]
+
+    for i, (patient_id, text) in enumerate(items, 1):
+        if i % 100 == 0:
+            print(f"  已导入 {i}/{len(items)}...")
 
         # 仅导入，不检索
         system.add_record(patient_id, text)
@@ -283,7 +286,7 @@ def demo_search():
     print("=" * 60)
 
     # 创建系统（加载已有索引）
-    system = create_system(data_dir="./data", threshold=0.5)
+    system = create_system(data_dir="./data", threshold=0.7)
 
     print(f"底库病例总数: {len(system.records)}")
 
@@ -291,29 +294,50 @@ def demo_search():
         print("底库为空，请先运行导入")
         return
 
-    # 列出前5个患者
-    print("\n底库前5个患者:")
-    for i, pid in enumerate(list(system.records.keys())[:5], 1):
-        print(f"  {i}. {pid}")
+    # 扫描 data/records 下的 txt 文件作为查询
+    query_records = scan_medical_records("./data/records")
 
-    # 用第一个患者测试检索
-    first_pid = list(system.records.keys())[0]
-    query_text = system.records[first_pid]['text']
+    if not query_records:
+        print("data/records/ 下没有查询病例文件")
+        return
 
-    print(f"\n使用患者 {first_pid} 进行检索测试...")
-    print(f"查询文本长度: {len(query_text)} 字符")
+    print(f"找到 {len(query_records)} 个查询病例文件")
 
-    results = system.search(query_text, top_k=5)
+    # 检索结果汇总
+    all_results = []
 
-    print(f"\n找到 {len(results)} 个相似病例:")
-    print("-" * 50)
-    for r in results:
-        print(f"\n患者ID: {r['id']}")
-        print(f"相似度: {r['similarity']}")
-        print(f"内容预览: {r['full_text'][:300]}...")
-        print("-" * 50)
+    for filename, query_text in query_records.items():
+        print(f"\n查询文件: {filename}")
 
-    print("\n" + "=" * 60)
+        results = system.search(query_text, top_k=10)
+
+        for r in results:
+            all_results.append({
+                'query_file': filename,
+                'matched_id': r['id'],
+                'similarity': r['similarity'],
+                'full_text': r['full_text']
+            })
+
+        print(f"  找到 {len(results)} 个相似病例")
+
+    # 保存结果到文件
+    output_file = "data/检索结果.txt"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("病历相似度检索结果\n")
+        f.write("=" * 80 + "\n\n")
+
+        for result in all_results:
+            f.write(f"查询文件: {result['query_file']}\n")
+            f.write(f"匹配病例: {result['matched_id']}\n")
+            f.write(f"相似度: {result['similarity']}\n")
+            f.write("-" * 80 + "\n")
+            f.write(result['full_text'])
+            f.write("\n" + "=" * 80 + "\n\n")
+
+    print(f"\n检索结果已保存到: {output_file}")
+    print(f"共 {len(all_results)} 条结果")
+    print("=" * 60)
 
 
 def main():
@@ -335,10 +359,6 @@ def main():
         demo_import_xlsx()
     else:
         demo_search()
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
