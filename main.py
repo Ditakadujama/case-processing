@@ -15,58 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from retrieval_system import create_system, MedicalRecordSimilaritySystem
 from record_parser import MedicalRecordParser
-
-
-def load_xlsx_records(filepath: str) -> dict:
-    """
-    读取 Excel，按 patient_id 分组合并记录
-    保留所有列信息
-
-    Args:
-        filepath: Excel 文件路径
-
-    Returns:
-        {patient_id: 合并后的病例文本}
-    """
-    import pandas as pd
-
-    print(f"读取 Excel 文件: {filepath}")
-    df = pd.read_excel(filepath, sheet_name='Sheet1')
-    print(f"总记录数: {len(df)} 行")
-
-    # 所有需要合并的列
-    columns_to_merge = [
-        'patient_info', 'chief_complaint', 'instrument_test',
-        'checkout', 'examine', 'doctor_advice',
-        'inspection_visit', 'history_illness',
-        'surgery_record', 'monitor', 'operation_record'
-    ]
-
-    records = {}
-    grouped = df.groupby('patient_id')
-
-    print(f"患者数量: {len(grouped)}")
-
-    for patient_id, group in grouped:
-        group = group.sort_values('date')
-        total = len(group)
-        combined_texts = []
-
-        for i, (_, row) in enumerate(group.iterrows(), 1):
-            date = row['date']
-            parts = [f"###就诊记录 {i}/{total} - {date}"]
-
-            for col in columns_to_merge:
-                val = row.get(col)
-                if pd.notna(val) and str(val).strip():
-                    parts.append(f"###{col}: {val}")
-
-            combined_texts.append('\n'.join(parts))
-
-        records[patient_id] = '\n\n'.join(combined_texts)
-
-    print(f"合并后病例数: {len(records)}")
-    return records
+from database import DBConfig, load_records_from_db
 
 
 def scan_medical_records(folder: str) -> dict:
@@ -138,6 +87,10 @@ def demo_auto_import():
 
     print(f"\n导入完成，共 {len(system.records)} 个病例")
 
+    # 一次性保存索引
+    system.save()
+    print("索引已保存")
+
     # 保存结果统计
     if system.records:
         print("\n底库病例列表:")
@@ -164,11 +117,11 @@ def demo_search_similar():
     # 创建系统
     system = create_system(data_dir="./data", threshold=0.5)
 
-    # 先导入所有病例到底库
+    # 先批量导入所有病例到底库
     print("\n[1] 导入病例到底库...")
-    for filename, text in records.items():
-        record_id = os.path.splitext(filename)[0]
-        system.add_record(record_id, text)
+    batch = {os.path.splitext(filename)[0]: text for filename, text in records.items()}
+    system.add_records_batch(batch)
+    system.save()
 
     print(f"    已导入 {len(system.records)} 个病例")
 
@@ -241,38 +194,33 @@ def demo_parse_only():
     print("\n" + "=" * 60)
 
 
-def demo_import_xlsx():
-    """从 Excel 导入病例（仅导入，不检索）"""
+def demo_import_from_db():
+    """从 MySQL 数据库导入病例（仅导入，不检索）"""
     print("=" * 60)
-    print("Excel 导入")
+    print("数据库导入")
     print("=" * 60)
 
-    xlsx_file = "patient_info (18).xlsx"
-    if not os.path.exists(xlsx_file):
-        print(f"Excel 文件不存在: {xlsx_file}")
-        return
+    cfg = DBConfig.from_env()
 
-    # 读取并合并 Excel
-    records = load_xlsx_records(xlsx_file)
+    # 从数据库读取
+    records = load_records_from_db(cfg)
 
     if not records:
-        print("未找到有效病例")
+        print("未找到有效病例，请先用 migrate_xlsx_to_mysql.py 迁移数据")
         return
 
     # 创建系统
     system = create_system(data_dir="./data", threshold=0.5)
 
-    print(f"\n开始导入 {len(records)} 个患者病例...")
-
     # 只导入前500个患者
     items = list(records.items())[:500]
 
-    for i, (patient_id, text) in enumerate(items, 1):
-        if i % 100 == 0:
-            print(f"  已导入 {i}/{len(items)}...")
+    print(f"\n开始导入 {len(items)} 个患者病例...")
 
-        # 仅导入，不检索
-        system.add_record(patient_id, text)
+    # 批量导入
+    batch = dict(items)
+    system.add_records_batch(batch)
+    system.save()
 
     print(f"\n导入完成！")
     print(f"底库病例总数: {len(system.records)}")
@@ -351,12 +299,12 @@ def main():
 
     print("\n")
     print("╔" + "═" * 58 + "╗")
-    print("║" + " " * 15 + "病历相似度检索系统" + " " * 22 + "║")
+    print("║" + " " * 15 + "病历相似度检索系统" + " " * 26 + "║")
     print("╚" + "═" * 58 + "╝")
     print()
 
     if args.mode == 'import':
-        demo_import_xlsx()
+        demo_import_from_db()
     else:
         demo_search()
 

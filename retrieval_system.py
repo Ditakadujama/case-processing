@@ -90,9 +90,44 @@ class MedicalRecordSimilaritySystem:
         }
         self.record_order.append(record_id)
 
-        # 持久化索引
-        if self.index_path:
-            self._save_index()
+    def add_records_batch(self, records: Dict[str, str]) -> None:
+        """
+        批量添加病例到检索系统
+
+        Args:
+            records: {record_id: text} 映射
+        """
+        if not records:
+            return
+
+        records_list = list(records.items())
+
+        # 批量解析
+        parsed_records = []
+        for record_id, text in records_list:
+            parsed_records.append(self.parser.parse(text))
+
+        # 批量提取特征
+        features = self.extractor.extract_batch(parsed_records)
+
+        if features.size == 0:
+            return
+
+        # 一次性添加到索引
+        self.index.add(features)
+
+        # 批量存储病例数据
+        for i, (record_id, text) in enumerate(records_list):
+            self.records[record_id] = {
+                'text': text,
+                'features': features[i],
+                'parsed_record': parsed_records[i]
+            }
+            self.record_order.append(record_id)
+
+    def save(self) -> None:
+        """手动保存索引和元数据到磁盘"""
+        self._save_index()
 
     def search(self,
                query_text: str,
