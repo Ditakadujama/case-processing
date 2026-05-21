@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from retrieval_system import create_system
-from database import DBConfig, load_records_from_db
+from data_migrate.database import DBConfig, load_records_from_db
 from timeline_parser import TimelineParser
 
 
