@@ -1,10 +1,9 @@
 """
 病历相似度检索系统 - 主程序入口
 
-功能演示:
-1. 自动扫描文件夹导入病历
-2. 入库病例
-3. 检索相似病例
+支持:
+1. 从 MySQL 导入病例并生成时间轴
+2. 检索相似病例并对比时间轴
 """
 
 import os
@@ -13,196 +12,59 @@ import sys
 # 确保项目根目录在 Python 路径中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from retrieval_system import create_system, MedicalRecordSimilaritySystem
-from record_parser import MedicalRecordParser
+from retrieval_system import create_system
 from database import DBConfig, load_records_from_db
+from timeline_parser import TimelineParser
 
 
 def scan_medical_records(folder: str) -> dict:
-    """
-    扫描文件夹，获取所有病历文本
-
-    Args:
-        folder: 病历文件所在文件夹
-
-    Returns:
-        {filename: text}
-    """
+    """扫描文件夹，获取所有病历文本"""
     records = {}
-
     if not os.path.exists(folder):
         print(f"文件夹不存在: {folder}")
         return records
-
     for filename in os.listdir(folder):
         if filename.endswith('.txt') and not filename.startswith('.'):
             filepath = os.path.join(folder, filename)
             with open(filepath, 'r', encoding='utf-8') as f:
                 records[filename] = f.read()
-
     return records
 
 
-def demo_auto_import():
-    """自动导入 records 文件夹中的所有病例"""
-    print("=" * 60)
-    print("自动导入演示 - 扫描文件夹导入所有病例")
-    print("=" * 60)
+def print_case_timeline(text: str, record_id: str) -> None:
+    """打印单个病例的时间轴概览"""
+    parser = TimelineParser()
+    events = parser.parse(text)
 
-    # 病例文件夹
-    records_folder = "./data/records"
+    print(f"\n  病例 [{record_id}] 时间轴概览:")
+    print(f"    总事件数: {len(events)}")
 
-    # 扫描病例
-    records = scan_medical_records(records_folder)
+    # 事件类型统计
+    from collections import Counter
+    type_counts = Counter(e.event_type for e in events)
+    type_str = ", ".join(f"{t}:{c}" for t, c in type_counts.most_common(5))
+    print(f"    事件类型: {type_str}")
 
-    if not records:
-        print(f"\n文件夹 {records_folder} 中没有找到病历文件")
-        print("请在 ./data/records/ 目录下放置 .txt 病历文件")
-        print("\n" + "=" * 60)
-        return
-
-    print(f"\n发现 {len(records)} 个病历文件:")
-    for filename in records.keys():
-        print(f"  - {filename}")
-
-    # 创建系统
-    system = create_system(data_dir="./data", threshold=0.5)
-
-    print(f"\n初始底库病例数: {len(system.records)}")
-
-    # 导入每个病例
-    print("\n开始导入...")
-    for filename, text in records.items():
-        record_id = os.path.splitext(filename)[0]  # 去掉扩展名
-        print(f"\n导入: {filename}")
-        print(f"  文本长度: {len(text)} 字符")
-
-        # 检索相似病例
-        results = system.search_and_add(text, record_id=record_id, top_k=5)
-        print(f"  找到 {len(results)} 个相似病例")
-
-        if results:
-            for r in results:
-                print(f"    - {r['id']}: 相似度 {r['similarity']}")
-
-    print(f"\n导入完成，共 {len(system.records)} 个病例")
-
-    # 一次性保存索引
-    system.save()
-    print("索引已保存")
-
-    # 保存结果统计
-    if system.records:
-        print("\n底库病例列表:")
-        for rid in system.records.keys():
-            print(f"  - {rid}")
-
-    print("\n" + "=" * 60)
-
-
-def demo_search_similar():
-    """从文件夹取出一个病例作为查询，演示检索功能"""
-    print("=" * 60)
-    print("相似病例检索演示")
-    print("=" * 60)
-
-    records_folder = "./data/records"
-    records = scan_medical_records(records_folder)
-
-    if not records:
-        print(f"\n文件夹 {records_folder} 中没有找到病历文件")
-        print("\n" + "=" * 60)
-        return
-
-    # 创建系统
-    system = create_system(data_dir="./data", threshold=0.5)
-
-    # 先批量导入所有病例到底库
-    print("\n[1] 导入病例到底库...")
-    batch = {os.path.splitext(filename)[0]: text for filename, text in records.items()}
-    system.add_records_batch(batch)
-    system.save()
-
-    print(f"    已导入 {len(system.records)} 个病例")
-
-    # 取第一个病例作为查询
-    print("\n[2] 检索相似病例...")
-    query_name = list(records.keys())[0]
-    query_text = records[query_name]
-
-    # 使用完整文本查询（与入库时一致）
-    query_for_search = query_text
-
-    print(f"    查询文件: {query_name}")
-    print(f"    查询长度: {len(query_for_search)} 字符")
-
-    results = system.search(query_for_search, top_k=5)
-
-    print(f"\n    找到 {len(results)} 个相似病例:")
-    for i, r in enumerate(results, 1):
-        print(f"\n{'='*60}")
-        print(f"  [{i}] {r['id']} (相似度: {r['similarity']})")
-        print(f"{'='*60}")
-        print(r['full_text'])
-        print(f"{'='*60}")
-
-    print("\n" + "=" * 60)
-
-
-def demo_parse_only():
-    """仅解析演示 - 不入库"""
-    print("=" * 60)
-    print("病历解析演示")
-    print("=" * 60)
-
-    records_folder = "./data/records"
-    records = scan_medical_records(records_folder)
-
-    if not records:
-        print(f"\n文件夹 {records_folder} 中没有找到病历文件")
-        print("\n" + "=" * 60)
-        return
-
-    parser = MedicalRecordParser()
-
-    # 解析第一个病例
-    filename = list(records.keys())[0]
-    text = records[filename]
-
-    print(f"\n解析文件: {filename}")
-    print(f"文本长度: {len(text)} 字符")
-
-    record = parser.parse(text)
-
-    print(f"\n患者信息:")
-    print(f"  姓名: {record.patient.name}")
-    print(f"  性别: {record.patient.gender}")
-    print(f"  年龄: {record.patient.age}岁")
-
-    print(f"\n诊断 ({len(record.diagnoses)} 个):")
-    for d in record.diagnoses[:5]:
-        print(f"  - {d.name}")
-
-    print(f"\n检验类别 ({len(record.lab_results)} 种):")
-    for cat in list(record.lab_results.keys())[:5]:
-        print(f"  - {cat}")
-
-    print(f"\n药物 ({len(record.medications)} 种):")
-    for m in record.medications[:5]:
-        print(f"  - {m.name}")
-
-    print("\n" + "=" * 60)
+    # T0-T6 节点
+    nodes = parser.generate_standard_nodes(events)
+    node_strs = []
+    for key in ["T0", "T1", "T2", "T3", "T4", "T5", "T6"]:
+        event = nodes[key]
+        if event:
+            ts = event.timestamp.strftime("%m-%d %H:%M") if event.timestamp else "N/A"
+            node_strs.append(f"{key}({ts})")
+        else:
+            node_strs.append(f"{key}(-)")
+    print(f"    病程节点: {' -> '.join(node_strs)}")
 
 
 def demo_import_from_db():
-    """从 MySQL 数据库导入病例（仅导入，不检索）"""
+    """从 MySQL 数据库导入病例，并生成时间轴"""
     print("=" * 60)
-    print("数据库导入")
+    print("数据库导入 + 时间轴解析")
     print("=" * 60)
 
     cfg = DBConfig.from_env()
-
-    # 从数据库读取
     records = load_records_from_db(cfg)
 
     if not records:
@@ -222,15 +84,26 @@ def demo_import_from_db():
     system.add_records_batch(batch)
     system.save()
 
-    print(f"\n导入完成！")
-    print(f"底库病例总数: {len(system.records)}")
+    print(f"\n导入完成！底库病例总数: {len(system.records)}")
+
+    # 为导入的病例生成时间轴
+    print("\n" + "-" * 60)
+    print("生成病例时间轴...")
+    print("-" * 60)
+
+    for record_id, text in list(batch.items())[:5]:
+        print_case_timeline(text, record_id)
+
+    if len(batch) > 5:
+        print(f"\n  ... 还有 {len(batch) - 5} 个病例（略）")
+
     print("\n" + "=" * 60)
 
 
 def demo_search():
-    """检索相似病例（使用已导入的数据）"""
+    """检索相似病例，并对比时间轴"""
     print("=" * 60)
-    print("相似病例检索")
+    print("相似病例检索 + 时间轴对比")
     print("=" * 60)
 
     # 创建系统（加载已有索引）
@@ -251,23 +124,53 @@ def demo_search():
 
     print(f"找到 {len(query_records)} 个查询病例文件")
 
-    # 检索结果汇总
+    timeline_parser = TimelineParser()
     all_results = []
 
     for filename, query_text in query_records.items():
-        print(f"\n查询文件: {filename}")
+        print(f"\n{'='*60}")
+        print(f"查询文件: {filename}")
+        print(f"{'='*60}")
 
-        results = system.search(query_text, top_k=10)
+        # 查询病例时间轴
+        query_events = timeline_parser.parse(query_text)
+        query_nodes = timeline_parser.generate_standard_nodes(query_events)
+        print(f"\n  查询病例时间轴节点:")
+        for key in ["T0", "T3", "T6"]:
+            event = query_nodes[key]
+            if event:
+                ts = event.timestamp.strftime("%m-%d %H:%M") if event.timestamp else "N/A"
+                print(f"    {key}: [{ts}] {event.description[:50]}")
 
-        for r in results:
+        # 检索相似病例
+        results = system.search(query_text, top_k=5)
+        print(f"\n  检索结果（Top {len(results)}）:")
+
+        for i, r in enumerate(results, 1):
+            print(f"\n  [{i}] {r['id']} (相似度: {r['similarity']})")
+
+            # 获取匹配病例的文本并解析时间轴
+            matched_text = system.records.get(r['id'], {}).get('text', '')
+            if matched_text:
+                matched_events = timeline_parser.parse(matched_text)
+                matched_nodes = timeline_parser.generate_standard_nodes(matched_events)
+                print(f"      匹配病例节点: ", end="")
+                node_strs = []
+                for key in ["T0", "T3", "T6"]:
+                    event = matched_nodes[key]
+                    if event:
+                        ts = event.timestamp.strftime("%m-%d %H:%M") if event.timestamp else "N/A"
+                        node_strs.append(f"{key}({ts})")
+                    else:
+                        node_strs.append(f"{key}(-)")
+                print(" -> ".join(node_strs))
+
             all_results.append({
                 'query_file': filename,
                 'matched_id': r['id'],
                 'similarity': r['similarity'],
                 'full_text': r['full_text']
             })
-
-        print(f"  找到 {len(results)} 个相似病例")
 
     # 保存结果到文件
     output_file = "data/检索结果.txt"
@@ -294,7 +197,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='病历相似度检索系统')
     parser.add_argument('--mode', choices=['import', 'search'], default='search',
-                        help='import: 导入Excel病例; search: 检索相似病例')
+                        help='import: 从数据库导入病例; search: 检索相似病例')
     args = parser.parse_args()
 
     print("\n")
