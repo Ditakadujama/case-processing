@@ -107,7 +107,7 @@ def demo_search():
     print("=" * 60)
 
     # 创建系统（加载已有索引）
-    system = create_system(data_dir="./data", threshold=0.7)
+    system = create_system(data_dir="./data", threshold=0.5)
 
     print(f"底库病例总数: {len(system.records)}")
 
@@ -142,12 +142,14 @@ def demo_search():
                 ts = event.timestamp.strftime("%m-%d %H:%M") if event.timestamp else "N/A"
                 print(f"    {key}: [{ts}] {event.description[:50]}")
 
-        # 检索相似病例
-        results = system.search(query_text, top_k=5)
+        # 检索相似病例（排除查询文件自身）
+        results = system.search(query_text, top_k=5, exclude_record_ids={filename})
         print(f"\n  检索结果（Top {len(results)}）:")
 
         for i, r in enumerate(results, 1):
-            print(f"\n  [{i}] {r['id']} (相似度: {r['similarity']})")
+            vec_sim = r.get('vector_similarity', r['similarity'])
+            tl_sim = r.get('timeline_similarity', '-')
+            print(f"\n  [{i}] {r['id']} (综合: {r['similarity']}, 向量: {vec_sim}, 病程: {tl_sim})")
 
             # 获取匹配病例的文本并解析时间轴
             matched_text = system.records.get(r['id'], {}).get('text', '')
@@ -169,6 +171,8 @@ def demo_search():
                 'query_file': filename,
                 'matched_id': r['id'],
                 'similarity': r['similarity'],
+                'vector_similarity': r.get('vector_similarity', r['similarity']),
+                'timeline_similarity': r.get('timeline_similarity', '-'),
                 'full_text': r['full_text']
             })
 
@@ -181,7 +185,9 @@ def demo_search():
         for result in all_results:
             f.write(f"查询文件: {result['query_file']}\n")
             f.write(f"匹配病例: {result['matched_id']}\n")
-            f.write(f"相似度: {result['similarity']}\n")
+            f.write(f"综合相似度: {result['similarity']}\n")
+            f.write(f"向量相似度: {result.get('vector_similarity', '-')}\n")
+            f.write(f"病程相似度: {result.get('timeline_similarity', '-')}\n")
             f.write("-" * 80 + "\n")
             f.write(result['full_text'])
             f.write("\n" + "=" * 80 + "\n\n")
@@ -202,7 +208,7 @@ def main():
 
     print("\n")
     print("╔" + "═" * 58 + "╗")
-    print("║" + " " * 15 + "病历相似度检索系统" + " " * 26 + "║")
+    print("║" + " " * 15 + "病历相似度检索系统" + " " * 25 + "║")
     print("╚" + "═" * 58 + "╝")
     print()
 

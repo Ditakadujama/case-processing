@@ -87,8 +87,8 @@ class TimelineParser:
         # 分割就诊记录块
         blocks = self._split_visit_blocks(text)
 
-        for block_date, block_text in blocks:
-            block_events = self._parse_block(block_date, block_text)
+        for i, (block_date, block_text) in enumerate(blocks):
+            block_events = self._parse_block(block_date, block_text, i, len(blocks))
             events.extend(block_events)
 
         # 全局提取：从 operation_record 等跨块内容中提取
@@ -121,47 +121,80 @@ class TimelineParser:
 
         return blocks
 
-    def _parse_block(self, block_date: Optional[datetime], block_text: str) -> List[TimelineEvent]:
-        """解析单个就诊记录块"""
+    def _parse_block(self, block_date: Optional[datetime], block_text: str,
+                     block_index: int = 0, total_blocks: int = 1) -> List[TimelineEvent]:
+        """解析单个就诊记录块，按就诊日期分类事件类型"""
         events = []
 
-        # 1. 块头本身作为 admission 事件
+        # 双语 section 提取辅助
+        def _get(*names):
+            for name in names:
+                result = self._extract_section(block_text, name)
+                if result and len(result.strip()) > 5:
+                    return result
+            return None
+
+        # 1. 根据就诊块位置和内容分类
+        event_type = self._classify_visit_block(block_text, block_index, total_blocks)
         if block_date:
             events.append(TimelineEvent(
                 timestamp=block_date,
-                event_type="admission",
+                event_type=event_type,
                 source_section="visit_record",
                 description=f"就诊记录: {block_date.date()}",
                 raw_text=block_text[:200],
                 structured_data={"date": block_date.isoformat()}
             ))
 
-        # 2. 解析 checkout（检验）—— 原始文本中 section 名为 "检验"
-        checkout_text = self._extract_section(block_text, "检验")
+        # 2. 检验（中/英文 section 名）
+        checkout_text = _get("检验", "checkout", "instrument_test")
         if checkout_text:
             events.extend(self._parse_checkout(checkout_text, block_date))
 
-        # 3. 解析 examine（检查）—— 原始文本中 section 名为 "检查"
-        examine_text = self._extract_section(block_text, "检查")
+        # 3. 检查
+        examine_text = _get("检查", "examine")
         if examine_text:
             events.extend(self._parse_examine(examine_text, block_date))
 
-        # 4. 解析 monitor（监测）—— 原始文本中 section 名为 "监测"
-        monitor_text = self._extract_section(block_text, "监测")
+        # 4. 监测
+        monitor_text = _get("监测", "monitor")
         if monitor_text:
             events.extend(self._parse_monitor(monitor_text, block_date))
 
-        # 5. 解析 surgery_record（手术）—— 原始文本中 section 名为 "手术记录"
-        surgery_text = self._extract_section(block_text, "手术记录")
+        # 5. 手术记录
+        surgery_text = _get("手术记录", "surgery_record")
         if surgery_text:
             events.extend(self._parse_surgery(surgery_text, block_date))
 
-        # 6. 解析 doctor_advice（医嘱/用药）—— 原始文本中 section 名为 "医嘱"
-        advice_text = self._extract_section(block_text, "医嘱")
+        # 6. 医嘱/用药
+        advice_text = _get("医嘱", "doctor_advice")
         if advice_text and block_date:
             events.extend(self._parse_medications(advice_text, block_date))
 
         return events
+
+    def _classify_visit_block(self, block_text: str, block_index: int, total_blocks: int) -> str:
+        """根据就诊块的位置和内容分类事件类型"""
+        # 首块 → admission
+        if block_index == 0:
+            return "admission"
+        # 末块 → discharge
+        if block_index == total_blocks - 1:
+            return "discharge"
+        # 中间块根据内容分类
+        if any(n in block_text for n in ["手术记录", "surgery_record", "手术名称"]):
+            surgery_text = self._extract_section(block_text, "手术记录") or self._extract_section(block_text, "surgery_record") or ""
+            if len(surgery_text.strip()) > 5:
+                return "surgery"
+        if any(n in block_text for n in ["检验", "checkout", "instrument_test"]):
+            checkout_text = self._extract_section(block_text, "检验") or self._extract_section(block_text, "checkout") or self._extract_section(block_text, "instrument_test") or ""
+            if len(checkout_text.strip()) > 5:
+                return "lab"
+        if any(n in block_text for n in ["医嘱", "doctor_advice"]):
+            return "medication"
+        if any(n in block_text for n in ["查房记录", "inspection_visit", "主要问题"]):
+            return "progress_note"
+        return "follow_up"
 
     def _parse_global_events(self, text: str) -> List[TimelineEvent]:
         """解析跨块的全局事件（operation_record 中的病程、转出记录等）"""

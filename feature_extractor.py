@@ -38,15 +38,18 @@ class FeatureExtractor:
             '凝血酶原时间', 'D-二聚体', '纤维蛋白原'
         ]
 
-        # 常用药物列表
+        # 常用药物列表（去重）
         self.medication_list = [
             '瑞芬太尼', '丙泊酚', '哌拉西林', '头孢', '青霉素',
             '呋塞米', '多巴酚丁胺', '肾上腺素', '去乙酰毛花苷',
             '艾司奥美拉唑', '奥美拉唑', '利多卡因', '肝素',
             '葡萄糖酸钙', '开塞露', '阿司匹林', '氯吡格雷',
-            '瑞芬太尼', '丙泊酚', '氯化钠', '葡萄糖', '林格',
+            '氯化钠', '葡萄糖', '林格',
             '万古霉素', '美罗培南', '头孢曲松', '左氧氟沙星'
         ]
+
+        # 手术类型列表（5-dim one-hot）
+        self.surgery_types = ['neuro', 'cardiac', 'general', 'ortho', 'other']
 
         # 诊断向量维度
         self.diag_dim = len(self.diagnosis_terms)
@@ -56,38 +59,77 @@ class FeatureExtractor:
         self.med_dim = len(self.medication_list)
         # 人口学向量维度
         self.demo_dim = 4
+        # 手术类型向量维度
+        self.surgery_dim = len(self.surgery_types)
+
+        # 特征组基础权重
+        self.group_weights = {
+            'diag': 1.5,
+            'lab': 0.6,
+            'med': 0.8,
+            'demo': 0.5,
+            'surgery': 1.5,
+        }
+
+        # IDF 权重（在 fit() 中计算）
+        self.idf_weights = None
 
     @property
     def total_dim(self) -> int:
         """总特征维度"""
-        return self.diag_dim + self.lab_dim + self.med_dim + self.demo_dim
+        return self.diag_dim + self.lab_dim + self.med_dim + self.demo_dim + self.surgery_dim
 
     def fit(self, records: List[MedicalRecord]):
-        """训练向量化器（预留接口）"""
-        # 词袋模型不需要训练，直接用固定词表
-        pass
+        """训练向量化器：计算 IDF 权重"""
+        if not records:
+            self.idf_weights = None
+            return
+
+        N = len(records)
+        # 统计每个维度在多少病历中出现（文档频率）
+        df = np.zeros(self.total_dim)
+
+        for record in records:
+            vec = self._extract_raw_vector(record)
+            df += (vec > 0).astype(float)
+
+        # 计算 IDF: log(N / df)，至少为 1.0（平滑）
+        idf = np.log(N / (df + 1e-8))
+        idf = np.maximum(idf, 0.0)  # 至少为 0
+        # 对于完全没有出现的维度，给一个基础权重 1.0
+        idf = np.where(df > 0, idf + 1.0, 1.0)
+
+        self.idf_weights = idf
+
+    def _extract_raw_vector(self, record: MedicalRecord) -> np.ndarray:
+        """提取原始特征向量（不带权重）"""
+        diag_vec = self._extract_diagnosis_vector(record)
+        lab_vec = self._extract_lab_vector(record)
+        med_vec = self._extract_medication_vector(record)
+        demo_vec = self._extract_demographic_vector(record)
+        surgery_vec = self._extract_surgery_type_vector(record)
+        return np.concatenate([diag_vec, lab_vec, med_vec, demo_vec, surgery_vec])
 
     def extract(self, record: MedicalRecord) -> np.ndarray:
         """
-        提取单个病历的特征向量
+        提取单个病历的特征向量（应用组权重和IDF权重）
 
         Returns:
             合并后的特征向量
         """
-        # 1. 诊断向量 (词袋)
-        diag_vec = self._extract_diagnosis_vector(record)
+        # 提取各组原始向量
+        diag_vec = self._extract_diagnosis_vector(record) * self.group_weights['diag']
+        lab_vec = self._extract_lab_vector(record) * self.group_weights['lab']
+        med_vec = self._extract_medication_vector(record) * self.group_weights['med']
+        demo_vec = self._extract_demographic_vector(record) * self.group_weights['demo']
+        surgery_vec = self._extract_surgery_type_vector(record) * self.group_weights['surgery']
 
-        # 2. 检验指标向量 (标准化数值)
-        lab_vec = self._extract_lab_vector(record)
+        # 合并所有向量
+        combined = np.concatenate([diag_vec, lab_vec, med_vec, demo_vec, surgery_vec])
 
-        # 3. 药物向量 (词袋)
-        med_vec = self._extract_medication_vector(record)
-
-        # 4. 人口学向量
-        demo_vec = self._extract_demographic_vector(record)
-
-        # 5. 合并所有向量
-        combined = np.concatenate([diag_vec, lab_vec, med_vec, demo_vec])
+        # 应用 IDF 权重
+        if self.idf_weights is not None:
+            combined = combined * self.idf_weights
 
         return combined
 
@@ -140,6 +182,17 @@ class FeatureExtractor:
             patient.weight / 150.0 if patient.weight else 0,  # 归一化体重
             patient.height / 200.0 if patient.height else 0,  # 归一化身高
         ])
+
+    def _extract_surgery_type_vector(self, record: MedicalRecord) -> np.ndarray:
+        """提取手术类型 one-hot 向量"""
+        vec = np.zeros(self.surgery_dim)
+        if record.surgery_type:
+            try:
+                idx = self.surgery_types.index(record.surgery_type)
+                vec[idx] = 1.0
+            except ValueError:
+                pass
+        return vec
 
     def extract_batch(self, records: List[MedicalRecord]) -> np.ndarray:
         """批量提取特征向量"""

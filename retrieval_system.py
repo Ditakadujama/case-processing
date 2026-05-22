@@ -7,9 +7,13 @@ from typing import List, Dict, Optional, Tuple
 import pickle
 import os
 
+import numpy as np
+
 from record_parser import MedicalRecordParser, MedicalRecord
 from feature_extractor import FeatureExtractor
 from similarity_index import create_index, VectorIndex
+from timeline_parser import TimelineParser
+from timeline_similarity import TimelineSimilarityScorer, TimelineFeatures
 
 
 class MedicalRecordSimilaritySystem:
@@ -26,25 +30,33 @@ class MedicalRecordSimilaritySystem:
                  similarity_threshold: float = 0.7,
                  feature_dim: int = None,
                  index_backend: str = "sklearn",
-                 index_path: Optional[str] = None):
+                 index_path: Optional[str] = None,
+                 alpha: float = 0.5,
+                 min_timeline_score: float = 0.3):
         """
         Args:
             similarity_threshold: 相似度阈值，低于此值的病例不返回
             feature_dim: 特征向量维度（自动从extractor获取）
             index_backend: 索引后端 "sklearn" 或 "faiss"
             index_path: 索引持久化路径
+            alpha: 向量相似度权重 (0~1)，默认0.5；最终分数 = alpha*向量 + (1-alpha)*时间轴
+            min_timeline_score: 时间轴相似度软惩罚阈值，低于此值时最终分数乘以0.5
         """
         self.threshold = similarity_threshold
         self.index_path = index_path
+        self.alpha = alpha
+        self.min_timeline_score = min_timeline_score
 
         # 组件初始化
         self.parser = MedicalRecordParser()
         self.extractor = FeatureExtractor()
+        self.timeline_parser = TimelineParser()
+        self.timeline_scorer = TimelineSimilarityScorer()
         # 自动获取特征维度
         self.feature_dim = feature_dim or self.extractor.total_dim
         self.index: VectorIndex = create_index(self.feature_dim, index_backend)
 
-        # 病例存储: id -> {text, features, parsed_record}
+        # 病例存储: id -> {text, features, parsed_record, timeline_events, standard_nodes, timeline_features}
         self.records: Dict[str, Dict] = {}
         self.record_order: List[str] = []  # 保持插入顺序
         self.record_count = 0
@@ -79,6 +91,14 @@ class MedicalRecordSimilaritySystem:
         # 提取特征（词袋模型不需要训练）
         features = self.extractor.extract(parsed_record)
 
+        # 解析时间轴并预计算特征（传入手术类型，避免从文本误分类）
+        timeline_events = self.timeline_parser.parse(text)
+        standard_nodes = self.timeline_parser.generate_standard_nodes(timeline_events)
+        timeline_features = self.timeline_scorer.extract_features(
+            timeline_events, standard_nodes,
+            surgery_type_hint=parsed_record.surgery_type or None
+        )
+
         # 添加到索引
         self.index.add(features.reshape(1, -1))
 
@@ -86,7 +106,10 @@ class MedicalRecordSimilaritySystem:
         self.records[record_id] = {
             'text': text,
             'features': features,
-            'parsed_record': parsed_record
+            'parsed_record': parsed_record,
+            'timeline_events': timeline_events,
+            'standard_nodes': standard_nodes,
+            'timeline_features': timeline_features
         }
         self.record_order.append(record_id)
 
@@ -116,12 +139,23 @@ class MedicalRecordSimilaritySystem:
         # 一次性添加到索引
         self.index.add(features)
 
-        # 批量存储病例数据
+        # 批量存储病例数据（含时间轴预计算）
         for i, (record_id, text) in enumerate(records_list):
+            parsed = parsed_records[i]
+            timeline_events = self.timeline_parser.parse(text)
+            standard_nodes = self.timeline_parser.generate_standard_nodes(timeline_events)
+            timeline_features = self.timeline_scorer.extract_features(
+                timeline_events, standard_nodes,
+                surgery_type_hint=parsed.surgery_type or None
+            )
+
             self.records[record_id] = {
                 'text': text,
                 'features': features[i],
-                'parsed_record': parsed_records[i]
+                'parsed_record': parsed,
+                'timeline_events': timeline_events,
+                'standard_nodes': standard_nodes,
+                'timeline_features': timeline_features
             }
             self.record_order.append(record_id)
 
@@ -133,7 +167,8 @@ class MedicalRecordSimilaritySystem:
                query_text: str,
                top_k: int = 10,
                auto_add: bool = False,
-               record_id: Optional[str] = None) -> List[Dict]:
+               record_id: Optional[str] = None,
+               exclude_record_ids: Optional[set] = None) -> List[Dict]:
         """
         检索相似病例
 
@@ -142,53 +177,88 @@ class MedicalRecordSimilaritySystem:
             top_k: 返回前K个最相似病例
             auto_add: 是否自动入库
             record_id: 病例ID（auto_add=True时必填）
+            exclude_record_ids: 需要排除的病例ID集合（如查询病例自身）
 
         Returns:
             [{'id': xxx, 'similarity': 0.85, 'text': xxx}, ...]
         """
         if auto_add:
-            return self.search_and_add(query_text, record_id, top_k)
+            return self.search_and_add(query_text, record_id, top_k, exclude_record_ids)
 
         # 仅检索（不入库）
-        return self._search_only(query_text, top_k)
+        return self._search_only(query_text, top_k, exclude_record_ids)
 
-    def _search_only(self, query_text: str, top_k: int) -> List[Dict]:
-        """仅检索，不入库"""
+    def _search_only(self, query_text: str, top_k: int, exclude_record_ids: Optional[set] = None) -> List[Dict]:
+        """仅检索，不入库（两阶段：向量粗排 + 时间轴精排）"""
         if not self.records:
             return []
 
-        # 解析并提取特征
+        exclude_record_ids = exclude_record_ids or set()
+
+        # 解析查询病历
         query_record = self.parser.parse(query_text)
         query_features = self.extractor.extract(query_record).reshape(1, -1)
 
-        # 检索
-        distances, indices = self.index.search(query_features, top_k)
+        # 解析查询病历的时间轴（传入手术类型）
+        query_events = self.timeline_parser.parse(query_text)
+        query_nodes = self.timeline_parser.generate_standard_nodes(query_events)
+        query_timeline_features = self.timeline_scorer.extract_features(
+            query_events, query_nodes,
+            surgery_type_hint=query_record.surgery_type or None
+        )
 
-        # 收集结果
-        results = []
+        # 第一阶段：向量检索，扩大候选池
+        vector_top_k = min(max(top_k * 5, 50), len(self.record_order))
+        distances, indices = self.index.search(query_features, vector_top_k)
+
+        # 第二阶段：时间轴相似度重排序
+        candidates = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx < 0 or idx >= len(self.record_order):
                 continue
 
-            similarity = self._distance_to_similarity(dist)
-            if similarity >= self.threshold:
-                record_id = self.record_order[idx]
-                results.append({
+            record_id = self.record_order[idx]
+            # 排除自身
+            if record_id in exclude_record_ids:
+                continue
+
+            vector_sim = self._distance_to_similarity(dist)
+
+            # 从缓存读取候选病例的时间轴特征
+            candidate_data = self.records[record_id]
+            cand_timeline_features = candidate_data.get('timeline_features')
+            if cand_timeline_features is not None:
+                timeline_sim = self.timeline_scorer.score(query_timeline_features, cand_timeline_features)
+            else:
+                # 向后兼容：老数据没有时间轴缓存时退回到向量相似度
+                timeline_sim = vector_sim
+
+            # 合并分数
+            final_sim = self.alpha * vector_sim + (1.0 - self.alpha) * timeline_sim
+
+            # 软惩罚：时间轴相似度极低时打压最终分数
+            if timeline_sim < self.min_timeline_score:
+                final_sim *= 0.5
+
+            if final_sim >= self.threshold:
+                candidates.append({
                     'id': record_id,
-                    'similarity': round(similarity, 4),
-                    'text': self.records[record_id]['text'][:200] + "...",  # 截断
+                    'similarity': round(final_sim, 4),
+                    'vector_similarity': round(vector_sim, 4),
+                    'timeline_similarity': round(timeline_sim, 4),
+                    'text': self.records[record_id]['text'][:200] + "...",
                     'full_text': self.records[record_id]['text']
                 })
 
-        # 按相似度排序
-        results.sort(key=lambda x: x['similarity'], reverse=True)
-
-        return results
+        # 按最终相似度排序，返回 top_k
+        candidates.sort(key=lambda x: x['similarity'], reverse=True)
+        return candidates[:top_k]
 
     def search_and_add(self,
                        query_text: str,
                        record_id: Optional[str] = None,
-                       top_k: int = 10) -> List[Dict]:
+                       top_k: int = 10,
+                       exclude_record_ids: Optional[set] = None) -> List[Dict]:
         """
         检索相似病例 + 自动入库
 
@@ -196,12 +266,13 @@ class MedicalRecordSimilaritySystem:
             query_text: 待查询病历文本
             record_id: 病例ID（若不提供则自动生成）
             top_k: 返回前K个最相似病例
+            exclude_record_ids: 需要排除的病例ID集合
 
         Returns:
             [{'id': xxx, 'similarity': 0.85, 'text': xxx}, ...]
         """
         # 1. 先检索（基于当前底库，不含新病例）
-        results = self._search_only(query_text, top_k)
+        results = self._search_only(query_text, top_k, exclude_record_ids)
 
         # 2. 自动入库
         if record_id is None:
@@ -227,13 +298,31 @@ class MedicalRecordSimilaritySystem:
         # 保存向量索引
         self.index.save(self.index_path)
 
+        # 构建精简的时间轴缓存用于持久化
+        timeline_cache = {}
+        for rid, data in self.records.items():
+            tf = data.get('timeline_features')
+            if tf is not None:
+                timeline_cache[rid] = {
+                    'visit_count': tf.visit_count,
+                    'total_span_days': tf.total_span_days,
+                    'visit_gaps': tf.visit_gaps,
+                    'diagnosis_keywords': list(tf.diagnosis_keywords),
+                    'event_type_sequence': tf.event_type_sequence,
+                    'surgery_type': tf.surgery_type,
+                    'surgery_keywords': list(tf.surgery_keywords),
+                }
+
         # 保存元数据
         metadata = {
             'records': {k: {'text': v['text']} for k, v in self.records.items()},
             'record_order': self.record_order,
             'threshold': self.threshold,
             'feature_dim': self.feature_dim,
-            'record_count': self.record_count
+            'record_count': self.record_count,
+            'alpha': self.alpha,
+            'min_timeline_score': self.min_timeline_score,
+            'timeline_cache': timeline_cache,
         }
         with open(self.index_path + ".meta", 'wb') as f:
             pickle.dump(metadata, f)
@@ -253,13 +342,37 @@ class MedicalRecordSimilaritySystem:
             self.threshold = metadata.get('threshold', 0.7)
             self.feature_dim = metadata.get('feature_dim', 600)
             self.record_count = metadata.get('record_count', len(self.record_order))
+            self.alpha = metadata.get('alpha', 0.6)
+            self.min_timeline_score = metadata.get('min_timeline_score', 0.1)
+            timeline_cache = metadata.get('timeline_cache', {})
 
-            # 重新解析病历
+            # 重新解析病历并恢复时间轴缓存
             for record_id, data in self.records.items():
                 parsed = self.parser.parse(data['text'])
                 features = self.extractor.extract(parsed)
                 data['features'] = features
                 data['parsed_record'] = parsed
+
+                # 恢复时间轴缓存（向后兼容：老索引可能没有新字段）
+                tc = timeline_cache.get(record_id)
+                if tc:
+                    # 检测新旧格式
+                    if 'visit_count' in tc:
+                        # 新格式（就诊计数模型）
+                        data['timeline_features'] = TimelineFeatures(
+                            visit_count=tc['visit_count'],
+                            total_span_days=tc['total_span_days'],
+                            visit_gaps=tc['visit_gaps'],
+                            diagnosis_keywords=set(tc['diagnosis_keywords']),
+                            event_type_sequence=tc['event_type_sequence'],
+                            surgery_type=tc.get('surgery_type'),
+                            surgery_keywords=set(tc.get('surgery_keywords', [])),
+                        )
+                    else:
+                        # 老格式（T0-T6 节点模型），丢弃并设为 None
+                        data['timeline_features'] = None
+                else:
+                    data['timeline_features'] = None
 
             # 加载向量索引
             from similarity_index import create_index

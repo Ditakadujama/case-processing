@@ -5,7 +5,7 @@
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 
 @dataclass
@@ -53,6 +53,8 @@ class MedicalRecord:
     medications: List[Medication] = field(default_factory=list)
     vital_signs: Dict[str, List] = field(default_factory=dict)
     raw_text: str = ""
+    surgery_type: str = ""       # 手术专科类型: neuro/cardiac/general/ortho/other
+    surgery_name: str = ""       # 手术名称
 
 
 class MedicalRecordParser:
@@ -87,6 +89,14 @@ class MedicalRecordParser:
             "胆红素", "心肌损伤", "肾功能", "肝功能", "感染"
         ]
 
+        # 手术分类规则: 关键词 -> 专科类型
+        self.surgery_type_rules = [
+            ("neuro", ["脊髓", "脑室", "颅脑", "脑", "血肿清除", "开颅", "神经内镜", "硬脊膜", "椎板", "髓内", "颅内", "脑膜", "神经减压", "听神经瘤"]),
+            ("cardiac", ["冠脉", "心脏", "搭桥", "CABG", "PCI", "瓣膜", "射频消融", "旁路移植", "心房", "心室", "起搏器", "主动脉球囊反搏", "主动脉", "二尖瓣", "三尖瓣", "房间隔", "室间隔"]),
+            ("general", ["肝脏", "胆囊", "胰腺", "胃肠", "阑尾", "脾", "甲状腺", "胃切除", "肠切除", "结肠", "直肠", "胆道", "腹腔"]),
+            ("ortho", ["骨折", "关节置换", "髋关节", "膝关节", "肩关节", "椎间盘", "椎弓根", "椎管", "植骨融合", "骨科", "肌腱", "韧带", "半月板", "颈椎", "胸椎", "腰椎", "脊柱", "截骨"]),
+        ]
+
     def parse(self, text: str) -> MedicalRecord:
         """解析病历文本"""
         record = MedicalRecord(raw_text=text)
@@ -108,6 +118,9 @@ class MedicalRecordParser:
 
         # 提取生命体征
         record.vital_signs = self.extract_vital_signs(text)
+
+        # 提取手术信息
+        record.surgery_type, record.surgery_name = self.extract_surgery_info(text)
 
         return record
 
@@ -261,6 +274,36 @@ class MedicalRecordParser:
             vitals["收缩压"] = [int(b) for b in bp_matches]
 
         return vitals
+
+    def extract_surgery_info(self, text: str) -> Tuple[str, str]:
+        """提取手术名称和专科类型"""
+        surgery_name = ""
+
+        # 1. 从手术记录中提取手术名称
+        surgery_text = self._extract_section(text, "手术记录")
+        if surgery_text:
+            name_match = re.search(r"手术名称[：:]?\s*([^\n;]+)", surgery_text)
+            if name_match:
+                surgery_name = name_match.group(1).strip()
+
+        # 2. 如果手术记录没有，从 operation_record 中查找
+        if not surgery_name:
+            op_text = self._extract_section(text, "operation_record")
+            if op_text:
+                # 匹配 "手术名称1:xxx" 或 "手术:xxx"
+                name_match = re.search(r"手术名称[\d]*[：:]?\s*([^\n;]+)", op_text)
+                if name_match:
+                    surgery_name = name_match.group(1).strip()
+
+        # 3. 分类手术类型
+        if not surgery_name:
+            return "", ""
+
+        for surgery_type, keywords in self.surgery_type_rules:
+            if any(kw in surgery_name for kw in keywords):
+                return surgery_type, surgery_name
+
+        return "other", surgery_name
 
     def _extract_section(self, text: str, section_name: str) -> Optional[str]:
         """提取病历的某个章节"""
