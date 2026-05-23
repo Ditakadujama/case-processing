@@ -126,16 +126,19 @@ class TimelineParser:
         """解析单个就诊记录块，按就诊日期分类事件类型"""
         events = []
 
-        # 双语 section 提取辅助
+        # 一次性切分所有 ### 章节，避免后续逐个 _extract_section 重复扫描全文
+        sections = self._split_all_sections(block_text)
+
+        # 双语 lookup
         def _get(*names):
             for name in names:
-                result = self._extract_section(block_text, name)
-                if result and len(result.strip()) > 5:
-                    return result
+                content = sections.get(name)
+                if content and len(content) > 5:
+                    return content
             return None
 
         # 1. 根据就诊块位置和内容分类
-        event_type = self._classify_visit_block(block_text, block_index, total_blocks)
+        event_type = self._classify_visit_block(block_text, block_index, total_blocks, sections)
         if block_date:
             events.append(TimelineEvent(
                 timestamp=block_date,
@@ -173,8 +176,11 @@ class TimelineParser:
 
         return events
 
-    def _classify_visit_block(self, block_text: str, block_index: int, total_blocks: int) -> str:
+    def _classify_visit_block(self, block_text: str, block_index: int, total_blocks: int,
+                               sections: Dict[str, str] = None) -> str:
         """根据就诊块的位置和内容分类事件类型"""
+        if sections is None:
+            sections = self._split_all_sections(block_text)
         # 首块 → admission
         if block_index == 0:
             return "admission"
@@ -182,17 +188,15 @@ class TimelineParser:
         if block_index == total_blocks - 1:
             return "discharge"
         # 中间块根据内容分类
-        if any(n in block_text for n in ["手术记录", "surgery_record", "手术名称"]):
-            surgery_text = self._extract_section(block_text, "手术记录") or self._extract_section(block_text, "surgery_record") or ""
-            if len(surgery_text.strip()) > 5:
-                return "surgery"
-        if any(n in block_text for n in ["检验", "checkout", "instrument_test"]):
-            checkout_text = self._extract_section(block_text, "检验") or self._extract_section(block_text, "checkout") or self._extract_section(block_text, "instrument_test") or ""
-            if len(checkout_text.strip()) > 5:
-                return "lab"
-        if any(n in block_text for n in ["医嘱", "doctor_advice"]):
+        surgery_text = sections.get("手术记录") or sections.get("surgery_record") or ""
+        if len(surgery_text) > 5:
+            return "surgery"
+        checkout_text = sections.get("检验") or sections.get("checkout") or sections.get("instrument_test") or ""
+        if len(checkout_text) > 5:
+            return "lab"
+        if sections.get("医嘱") or sections.get("doctor_advice"):
             return "medication"
-        if any(n in block_text for n in ["查房记录", "inspection_visit", "主要问题"]):
+        if sections.get("查房记录") or sections.get("inspection_visit") or "主要问题" in block_text:
             return "progress_note"
         return "follow_up"
 
@@ -646,11 +650,20 @@ class TimelineParser:
                 continue
         return None
 
+    # 一次性切分所有 ### 章节的正则（类级别，复用）
+    _section_split_pattern = re.compile(r'###([^：:\n]+)[：:]?(.*?)(?=###[^\n]|\Z)', re.DOTALL)
+
+    def _split_all_sections(self, text: str) -> Dict[str, str]:
+        """一次正则扫描切分所有 ### 章节，返回 {章节名: 内容}（用于避免重复扫描）"""
+        sections = {}
+        for match in self._section_split_pattern.finditer(text):
+            sections[match.group(1).strip()] = match.group(2).strip()
+        return sections
+
     def _extract_section(self, text: str, section_name: str) -> Optional[str]:
-        """提取病历的某个章节"""
-        pattern = rf"###{section_name}[：:]?(.*?)(?=###[^\n]|\Z)"
-        match = re.search(pattern, text, re.DOTALL)
-        return match.group(1).strip() if match else None
+        """提取病历的某个章节（单次查找时使用；批量查找请用 _split_all_sections）"""
+        # 直接委托给 _split_all_sections 然后取单个 key
+        return self._split_all_sections(text).get(section_name)
 
     def _extract_first_line(self, text: str) -> str:
         """提取文本的第一行非空内容"""
