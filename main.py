@@ -72,10 +72,10 @@ def demo_import_from_db(num_workers: int = 1):
         return
 
     # 创建系统
-    system = create_system(data_dir="./data", threshold=0.5)
+    system = create_system(data_dir="./data", threshold=0.45)
 
-    # 导入全部患者
-    items = list(records.items())
+    # 导入前500个患者（测试用）
+    items = list(records.items())[:500]
 
     print(f"\n开始导入 {len(items)} 个患者病例...")
 
@@ -107,7 +107,7 @@ def demo_search():
     print("=" * 60)
 
     # 创建系统（加载已有索引）
-    system = create_system(data_dir="./data", threshold=0.5)
+    system = create_system(data_dir="./data", threshold=0.45)
 
     print(f"底库病例总数: {len(system.records)}")
 

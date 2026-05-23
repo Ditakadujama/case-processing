@@ -85,7 +85,8 @@ class TimelineSimilarityScorer:
     def extract_features(self,
                          events: List[TimelineEvent],
                          nodes: Dict[str, Optional[TimelineEvent]],
-                         surgery_type_hint: Optional[str] = None) -> TimelineFeatures:
+                         surgery_type_hint: Optional[str] = None,
+                         surgery_keywords_hint: Optional[Set[str]] = None) -> TimelineFeatures:
         """从时间轴事件中提取预计算特征
 
         Args:
@@ -168,6 +169,10 @@ class TimelineSimilarityScorer:
                             if kw in surgery_name:
                                 surgery_keywords.add(kw)
 
+        # 合并外部提供的关键词（来自 record_parser）
+        if surgery_keywords_hint:
+            surgery_keywords.update(surgery_keywords_hint)
+
         return TimelineFeatures(
             visit_count=visit_count,
             total_span_days=total_span_days,
@@ -229,22 +234,34 @@ class TimelineSimilarityScorer:
         return float(total)
 
     def _surgery_type_score(self, query: TimelineFeatures, candidate: TimelineFeatures) -> float:
-        """手术类型匹配分数"""
+        """手术类型软匹配分数（基于 Jaccard 关键词重叠）"""
         has_q = bool(query.surgery_type)
         has_c = bool(candidate.surgery_type)
 
+        # 计算关键词 Jaccard 相似度
+        if query.surgery_keywords or candidate.surgery_keywords:
+            inter = len(query.surgery_keywords & candidate.surgery_keywords)
+            union = len(query.surgery_keywords | candidate.surgery_keywords)
+            kw_jaccard = inter / union if union > 0 else 0.0
+        else:
+            kw_jaccard = 0.0
+
+        # 双方都无手术类型
         if not has_q and not has_c:
-            return 1.0  # 都没有手术，匹配
-        if has_q and has_c:
-            if query.surgery_type == candidate.surgery_type:
-                # 同类型手术，额外奖励手术关键词重叠
-                kw_overlap = 0.0
-                if query.surgery_keywords and candidate.surgery_keywords:
-                    inter = len(query.surgery_keywords & candidate.surgery_keywords)
-                    kw_overlap = min(0.2, inter * 0.05)  # 最多额外 0.2
-                return 1.0 + kw_overlap
-            return 0.0  # 不同类型手术
-        return 0.0  # 一个有手术一个没有
+            if kw_jaccard > 0:
+                return 0.5 + 0.5 * kw_jaccard
+            return 1.0
+
+        # 双方同类型
+        if has_q and has_c and query.surgery_type == candidate.surgery_type:
+            return 1.0 + min(0.2, kw_jaccard * 0.3)
+
+        # 双方不同类型 → 关键词软回退
+        if has_q and has_c and query.surgery_type != candidate.surgery_type:
+            return kw_jaccard * 0.5
+
+        # 一方有类型、一方无 → 关键词作为桥梁
+        return kw_jaccard * 0.8
 
     @staticmethod
     def _weighted_lcs_similarity(seq_a: List[str], seq_b: List[str]) -> float:

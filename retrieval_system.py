@@ -29,12 +29,14 @@ def _worker_parse_record(item):
 
 def _worker_parse_timeline(item):
     """提取单条病历的时间轴特征（多进程 worker）"""
-    record_id, text, surgery_type = item
+    record_id, text, surgery_type, surgery_keywords = item
     timeline_parser = TimelineParser()
     scorer = TimelineSimilarityScorer()
     events = timeline_parser.parse(text)
     nodes = timeline_parser.generate_standard_nodes(events)
-    features = scorer.extract_features(events, nodes, surgery_type_hint=surgery_type or None)
+    features = scorer.extract_features(events, nodes,
+                                        surgery_type_hint=surgery_type or None,
+                                        surgery_keywords_hint=surgery_keywords or None)
     return record_id, events, nodes, features
 
 
@@ -53,7 +55,7 @@ class MedicalRecordSimilaritySystem:
                  feature_dim: int = None,
                  index_backend: str = "sklearn",
                  index_path: Optional[str] = None,
-                 alpha: float = 0.5,
+                 alpha: float = 0.4,
                  min_timeline_score: float = 0.3):
         """
         Args:
@@ -113,12 +115,13 @@ class MedicalRecordSimilaritySystem:
         # 提取特征（词袋模型不需要训练）
         features = self.extractor.extract(parsed_record)
 
-        # 解析时间轴并预计算特征（传入手术类型，避免从文本误分类）
+        # 解析时间轴并预计算特征（传入手术类型和关键词，避免从文本误分类）
         timeline_events = self.timeline_parser.parse(text)
         standard_nodes = self.timeline_parser.generate_standard_nodes(timeline_events)
         timeline_features = self.timeline_scorer.extract_features(
             timeline_events, standard_nodes,
-            surgery_type_hint=parsed_record.surgery_type or None
+            surgery_type_hint=parsed_record.surgery_type or None,
+            surgery_keywords_hint=parsed_record.surgery_keywords or None
         )
 
         # 添加到索引
@@ -177,9 +180,11 @@ class MedicalRecordSimilaritySystem:
 
         # ── 阶段4：时间轴预计算 ──
         if workers > 1:
-            # 准备并行输入：(record_id, text, surgery_type)
+            # 准备并行输入：(record_id, text, surgery_type, surgery_keywords)
             timeline_inputs = [
-                (rid, txt, parsed_records[i].surgery_type or None)
+                (rid, txt,
+                 parsed_records[i].surgery_type or None,
+                 parsed_records[i].surgery_keywords or None)
                 for i, (rid, txt) in enumerate(records_list)
             ]
             print(f"  [阶段4/4] 并行提取时间轴 (workers={workers}) ...")
@@ -194,7 +199,8 @@ class MedicalRecordSimilaritySystem:
                 nodes = self.timeline_parser.generate_standard_nodes(events)
                 feat = self.timeline_scorer.extract_features(
                     events, nodes,
-                    surgery_type_hint=parsed_records[i].surgery_type or None
+                    surgery_type_hint=parsed_records[i].surgery_type or None,
+                    surgery_keywords_hint=parsed_records[i].surgery_keywords or None
                 )
                 timeline_map[record_id] = (events, nodes, feat)
 
@@ -258,11 +264,12 @@ class MedicalRecordSimilaritySystem:
         query_nodes = self.timeline_parser.generate_standard_nodes(query_events)
         query_timeline_features = self.timeline_scorer.extract_features(
             query_events, query_nodes,
-            surgery_type_hint=query_record.surgery_type or None
+            surgery_type_hint=query_record.surgery_type or None,
+            surgery_keywords_hint=query_record.surgery_keywords or None
         )
 
         # 第一阶段：向量检索，扩大候选池
-        vector_top_k = min(max(top_k * 5, 50), len(self.record_order))
+        vector_top_k = min(max(top_k * 20, 100), len(self.record_order))
         distances, indices = self.index.search(query_features, vector_top_k)
 
         # 第二阶段：时间轴相似度重排序
@@ -452,7 +459,7 @@ class MedicalRecordSimilaritySystem:
 
 
 def create_system(data_dir: str = "./data",
-                  threshold: float = 0.7) -> MedicalRecordSimilaritySystem:
+                  threshold: float = 0.45) -> MedicalRecordSimilaritySystem:
     """
     工厂函数：创建检索系统
 

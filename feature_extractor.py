@@ -3,10 +3,12 @@
 将结构化病历转为特征向量
 """
 
+import re
 import numpy as np
 from typing import List
 
 from record_parser import MedicalRecord
+from timeline_similarity import SURGERY_TYPE_RULES
 
 
 class FeatureExtractor:
@@ -48,8 +50,14 @@ class FeatureExtractor:
             '万古霉素', '美罗培南', '头孢曲松', '左氧氟沙星'
         ]
 
-        # 手术类型列表（5-dim one-hot）
+        # 手术类型列表（5-dim soft count，基于已验证的手术关键词）
         self.surgery_types = ['neuro', 'cardiac', 'general', 'ortho', 'other']
+
+        # 构建 keyword → specialty 映射（从 SURGERY_TYPE_RULES）
+        self._keyword_to_specialty = {}
+        for stype, keywords in SURGERY_TYPE_RULES:
+            for kw in keywords:
+                self._keyword_to_specialty[kw] = stype
 
         # 诊断向量维度
         self.diag_dim = len(self.diagnosis_terms)
@@ -184,14 +192,18 @@ class FeatureExtractor:
         ])
 
     def _extract_surgery_type_vector(self, record: MedicalRecord) -> np.ndarray:
-        """提取手术类型 one-hot 向量"""
+        """提取专科软信号向量（基于已验证的手术关键词计数）"""
         vec = np.zeros(self.surgery_dim)
-        if record.surgery_type:
-            try:
-                idx = self.surgery_types.index(record.surgery_type)
-                vec[idx] = 1.0
-            except ValueError:
-                pass
+        if not record.surgery_keywords:
+            return vec
+        # 统计每个专科命中的关键词数
+        for kw in record.surgery_keywords:
+            stype = self._keyword_to_specialty.get(kw)
+            if stype and stype != 'other':
+                idx = self.surgery_types.index(stype)
+                vec[idx] += 1.0
+        # 归一化：最多 3 个命中即饱和到 1.0
+        vec = np.minimum(vec / 3.0, 1.0)
         return vec
 
     def extract_batch(self, records: List[MedicalRecord]) -> np.ndarray:

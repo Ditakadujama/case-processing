@@ -5,7 +5,7 @@
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Set, Tuple
 
 
 @dataclass
@@ -55,6 +55,7 @@ class MedicalRecord:
     raw_text: str = ""
     surgery_type: str = ""       # 手术专科类型: neuro/cardiac/general/ortho/other
     surgery_name: str = ""       # 手术名称
+    surgery_keywords: Set[str] = field(default_factory=set)  # 手术/专科关键词（用于软匹配）
 
 
 class MedicalRecordParser:
@@ -121,6 +122,9 @@ class MedicalRecordParser:
 
         # 提取手术信息
         record.surgery_type, record.surgery_name = self.extract_surgery_info(text)
+
+        # 从多章节提取手术关键词（用于软匹配）
+        record.surgery_keywords = self._extract_surgery_keywords_from_text(text, record.surgery_name)
 
         return record
 
@@ -276,15 +280,22 @@ class MedicalRecordParser:
         return vitals
 
     def extract_surgery_info(self, text: str) -> Tuple[str, str]:
-        """提取手术名称和专科类型"""
+        """提取手术名称和专科类型（支持中英文双语章节名）"""
         surgery_name = ""
 
-        # 1. 从手术记录中提取手术名称
-        surgery_text = self._extract_section(text, "手术记录")
+        # 1. 从手术记录中提取手术名称（尝试中英文章节名）
+        surgery_text = (self._extract_section(text, "手术记录")
+                        or self._extract_section(text, "surgery_record"))
         if surgery_text:
             name_match = re.search(r"手术名称[：:]?\s*([^\n;]+)", surgery_text)
             if name_match:
                 surgery_name = name_match.group(1).strip()
+            # 如果没找到"手术名称"字段，尝试其他模式
+            if not surgery_name:
+                # 尝试 "手术:" 模式
+                name_match = re.search(r"手术[：:]\s*([^\n;]+)", surgery_text)
+                if name_match:
+                    surgery_name = name_match.group(1).strip()
 
         # 2. 如果手术记录没有，从 operation_record 中查找
         if not surgery_name:
@@ -304,6 +315,36 @@ class MedicalRecordParser:
                 return surgery_type, surgery_name
 
         return "other", surgery_name
+
+    def _extract_surgery_keywords_from_text(self, text: str, surgery_name: str = "") -> Set[str]:
+        """从多章节提取手术/专科关键词，用于软匹配"""
+        keywords_found: Set[str] = set()
+
+        # 搜索可能包含手术信息的章节（中英文双语）
+        sections_text = ""
+        section_names = [
+            "chief_complaint", "inspection_visit", "history_illness",
+            "surgery_record", "手术记录",
+        ]
+        for name in section_names:
+            section = self._extract_section(text, name)
+            if section:
+                sections_text += section + " "
+
+        if sections_text.strip():
+            for _, keywords in self.surgery_type_rules:
+                for kw in keywords:
+                    if kw in sections_text:
+                        keywords_found.add(kw)
+
+        # 也从已识别的手术名称中提取关键词
+        if surgery_name:
+            for _, keywords in self.surgery_type_rules:
+                for kw in keywords:
+                    if kw in surgery_name:
+                        keywords_found.add(kw)
+
+        return keywords_found
 
     def _extract_section(self, text: str, section_name: str) -> Optional[str]:
         """提取病历的某个章节"""
