@@ -6,6 +6,7 @@
 from typing import List, Dict, Optional, Tuple
 import pickle
 import os
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
@@ -14,6 +15,27 @@ from feature_extractor import FeatureExtractor
 from similarity_index import create_index, VectorIndex
 from timeline_parser import TimelineParser
 from timeline_similarity import TimelineSimilarityScorer, TimelineFeatures
+
+
+# ── 模块级 worker 函数（供 ProcessPoolExecutor 使用）─────────────────────
+
+def _worker_parse_record(item):
+    """解析单条病历文本（多进程 worker）"""
+    record_id, text = item
+    parser = MedicalRecordParser()
+    parsed = parser.parse(text)
+    return record_id, text, parsed
+
+
+def _worker_parse_timeline(item):
+    """提取单条病历的时间轴特征（多进程 worker）"""
+    record_id, text, surgery_type = item
+    timeline_parser = TimelineParser()
+    scorer = TimelineSimilarityScorer()
+    events = timeline_parser.parse(text)
+    nodes = timeline_parser.generate_standard_nodes(events)
+    features = scorer.extract_features(events, nodes, surgery_type_hint=surgery_type or None)
+    return record_id, events, nodes, features
 
 
 class MedicalRecordSimilaritySystem:
@@ -113,49 +135,81 @@ class MedicalRecordSimilaritySystem:
         }
         self.record_order.append(record_id)
 
-    def add_records_batch(self, records: Dict[str, str]) -> None:
+    def add_records_batch(self, records: Dict[str, str], num_workers: int = 1) -> None:
         """
         批量添加病例到检索系统
 
         Args:
             records: {record_id: text} 映射
+            num_workers: 并行进程数（1=单进程，>1=多进程并行解析和时间轴提取）
         """
         if not records:
             return
 
         records_list = list(records.items())
+        n = len(records_list)
+        workers = min(max(num_workers, 1), n)
 
-        # 批量解析
-        parsed_records = []
-        for record_id, text in records_list:
-            parsed_records.append(self.parser.parse(text))
+        # ── 阶段1：解析病历 ──
+        if workers > 1:
+            print(f"  [阶段1/4] 并行解析 {n} 条病历 (workers={workers}) ...")
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                parsed_results = list(executor.map(_worker_parse_record, records_list))
+            # executor.map 保持顺序，解包
+            parsed_records = [p for _, _, p in parsed_results]
+            records_list = [(rid, txt) for rid, txt, _ in parsed_results]
+        else:
+            parsed_records = []
+            for record_id, text in records_list:
+                parsed_records.append(self.parser.parse(text))
 
-        # 批量提取特征
+        # IDF 拟合（基于全量解析结果）
+        self.extractor.fit(parsed_records)
+
+        # ── 阶段2：特征提取 ──
         features = self.extractor.extract_batch(parsed_records)
 
         if features.size == 0:
             return
 
-        # 一次性添加到索引
+        # ── 阶段3：向量入索引 ──
         self.index.add(features)
 
-        # 批量存储病例数据（含时间轴预计算）
+        # ── 阶段4：时间轴预计算 ──
+        if workers > 1:
+            # 准备并行输入：(record_id, text, surgery_type)
+            timeline_inputs = [
+                (rid, txt, parsed_records[i].surgery_type or None)
+                for i, (rid, txt) in enumerate(records_list)
+            ]
+            print(f"  [阶段4/4] 并行提取时间轴 (workers={workers}) ...")
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                timeline_results = list(executor.map(_worker_parse_timeline, timeline_inputs))
+            # 构建 record_id → timeline 结果映射
+            timeline_map = {rid: (events, nodes, feat) for rid, events, nodes, feat in timeline_results}
+        else:
+            timeline_map = {}
+            for i, (record_id, text) in enumerate(records_list):
+                events = self.timeline_parser.parse(text)
+                nodes = self.timeline_parser.generate_standard_nodes(events)
+                feat = self.timeline_scorer.extract_features(
+                    events, nodes,
+                    surgery_type_hint=parsed_records[i].surgery_type or None
+                )
+                timeline_map[record_id] = (events, nodes, feat)
+
+        # 批量存储病例数据
         for i, (record_id, text) in enumerate(records_list):
             parsed = parsed_records[i]
-            timeline_events = self.timeline_parser.parse(text)
-            standard_nodes = self.timeline_parser.generate_standard_nodes(timeline_events)
-            timeline_features = self.timeline_scorer.extract_features(
-                timeline_events, standard_nodes,
-                surgery_type_hint=parsed.surgery_type or None
-            )
+            events, nodes, tl_feat = timeline_map[record_id]
 
             self.records[record_id] = {
                 'text': text,
                 'features': features[i],
                 'parsed_record': parsed,
-                'timeline_events': timeline_events,
-                'standard_nodes': standard_nodes,
-                'timeline_features': timeline_features
+                'timeline_events': events,
+                'standard_nodes': nodes,
+                'timeline_features': tl_feat,
             }
             self.record_order.append(record_id)
 

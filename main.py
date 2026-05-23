@@ -58,7 +58,7 @@ def print_case_timeline(text: str, record_id: str) -> None:
     print(f"    病程节点: {' -> '.join(node_strs)}")
 
 
-def demo_import_from_db():
+def demo_import_from_db(num_workers: int = 1):
     """从 MySQL 数据库导入病例，并生成时间轴"""
     print("=" * 60)
     print("数据库导入 + 时间轴解析")
@@ -74,14 +74,14 @@ def demo_import_from_db():
     # 创建系统
     system = create_system(data_dir="./data", threshold=0.5)
 
-    # 只导入前500个患者
-    items = list(records.items())[:500]
+    # 导入全部患者
+    items = list(records.items())
 
     print(f"\n开始导入 {len(items)} 个患者病例...")
 
-    # 批量导入
+    # 批量导入（支持多进程并行）
     batch = dict(items)
-    system.add_records_batch(batch)
+    system.add_records_batch(batch, num_workers=num_workers)
     system.save()
 
     print(f"\n导入完成！底库病例总数: {len(system.records)}")
@@ -204,7 +204,15 @@ def main():
     parser = argparse.ArgumentParser(description='病历相似度检索系统')
     parser.add_argument('--mode', choices=['import', 'search'], default='search',
                         help='import: 从数据库导入病例; search: 检索相似病例')
+    parser.add_argument('--workers', '-j', type=int, default=1,
+                        help='导入时并行处理的进程数（默认1=单进程，设为0则自动使用全部CPU核心）')
     args = parser.parse_args()
+
+    # 解析 workers 数量
+    num_workers = args.workers
+    if num_workers == 0:
+        import multiprocessing
+        num_workers = multiprocessing.cpu_count()
 
     print("\n")
     print("╔" + "═" * 58 + "╗")
@@ -213,7 +221,7 @@ def main():
     print()
 
     if args.mode == 'import':
-        demo_import_from_db()
+        demo_import_from_db(num_workers=num_workers)
     else:
         demo_search()
 
