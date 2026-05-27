@@ -82,32 +82,43 @@ class FeatureExtractor:
         # IDF 权重（在 fit() 中计算）
         self.idf_weights = None
 
+        # 预计算每个维度的组权重向量（用于 _apply_weights 快速应用）
+        self._group_weight_vector = np.concatenate([
+            np.full(self.diag_dim, self.group_weights['diag']),
+            np.full(self.lab_dim, self.group_weights['lab']),
+            np.full(self.med_dim, self.group_weights['med']),
+            np.full(self.demo_dim, self.group_weights['demo']),
+            np.full(self.surgery_dim, self.group_weights['surgery']),
+        ])
+
     @property
     def total_dim(self) -> int:
         """总特征维度"""
         return self.diag_dim + self.lab_dim + self.med_dim + self.demo_dim + self.surgery_dim
 
     def fit(self, records: List[MedicalRecord]):
-        """训练向量化器：计算 IDF 权重"""
+        """训练向量化器：计算 IDF 权重，返回 raw_vectors 列表供 extract_batch() 复用"""
         if not records:
             self.idf_weights = None
-            return
+            return []
 
         N = len(records)
-        # 统计每个维度在多少病历中出现（文档频率）
         df = np.zeros(self.total_dim)
+        raw_vectors = []
 
         for record in records:
             vec = self._extract_raw_vector(record)
+            raw_vectors.append(vec)
             df += (vec > 0).astype(float)
 
         # 计算 IDF: log(N / df)，至少为 1.0（平滑）
         idf = np.log(N / (df + 1e-8))
-        idf = np.maximum(idf, 0.0)  # 至少为 0
+        idf = np.maximum(idf, 0.0)
         # 对于完全没有出现的维度，给一个基础权重 1.0
         idf = np.where(df > 0, idf + 1.0, 1.0)
 
         self.idf_weights = idf
+        return raw_vectors
 
     def _extract_raw_vector(self, record: MedicalRecord) -> np.ndarray:
         """提取原始特征向量（不带权重）"""
@@ -139,6 +150,13 @@ class FeatureExtractor:
         if self.idf_weights is not None:
             combined = combined * self.idf_weights
 
+        return combined
+
+    def _apply_weights(self, raw_vector: np.ndarray) -> np.ndarray:
+        """对已提取的子向量应用组权重和IDF权重"""
+        combined = raw_vector * self._group_weight_vector
+        if self.idf_weights is not None:
+            combined = combined * self.idf_weights
         return combined
 
     def _extract_diagnosis_vector(self, record: MedicalRecord) -> np.ndarray:
@@ -206,14 +224,19 @@ class FeatureExtractor:
         vec = np.minimum(vec / 3.0, 1.0)
         return vec
 
-    def extract_batch(self, records: List[MedicalRecord]) -> np.ndarray:
-        """批量提取特征向量"""
+    def extract_batch(self, records: List[MedicalRecord],
+                      raw_vectors: list = None) -> np.ndarray:
+        """批量提取特征向量。若提供 raw_vectors（来自 fit()），跳过子向量提取"""
         if not records:
             return np.array([])
 
         vectors = []
-        for record in records:
-            vectors.append(self.extract(record))
+        for i, record in enumerate(records):
+            if raw_vectors is not None and i < len(raw_vectors):
+                vec = self._apply_weights(raw_vectors[i])
+            else:
+                vec = self.extract(record)
+            vectors.append(vec)
 
         return np.array(vectors)
 

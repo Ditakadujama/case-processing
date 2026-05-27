@@ -1,15 +1,14 @@
 """
 病历相似度检索系统 - 主程序入口
 
-支持:
-1. 从 MySQL 导入病例并生成时间轴
-2. 检索相似病例并对比时间轴
+两种模式:
+- build:  从 MySQL medical_records 原始表解析全量病历，提取特征向量，存入 record_vectors 表
+- search: 从 MySQL record_vectors 表加载预计算向量，检索相似病例
 """
 
 import os
 import sys
 
-# 确保项目根目录在 Python 路径中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from retrieval_system import create_system
@@ -31,91 +30,89 @@ def scan_medical_records(folder: str) -> dict:
     return records
 
 
-def print_case_timeline(text: str, record_id: str) -> None:
-    """打印单个病例的时间轴概览"""
-    parser = TimelineParser()
-    events = parser.parse(text)
+def build_index(num_workers: int = 1):
+    """
+    build 模式：从 MySQL medical_records 原始表分批解析病历，提取特征向量，即时存入 record_vectors 表。
 
-    print(f"\n  病例 [{record_id}] 时间轴概览:")
-    print(f"    总事件数: {len(events)}")
+    适用场景：
+    - 初次部署，还没有向量索引
+    - 原始病历数据有更新（新增/修改），需要重建索引
+    - 特征提取算法有改动，需要重新提取
+    """
+    from vector_store import MySQLVectorStore
 
-    # 事件类型统计
-    from collections import Counter
-    type_counts = Counter(e.event_type for e in events)
-    type_str = ", ".join(f"{t}:{c}" for t, c in type_counts.most_common(5))
-    print(f"    事件类型: {type_str}")
-
-    # T0-T6 节点
-    nodes = parser.generate_standard_nodes(events)
-    node_strs = []
-    for key in ["T0", "T1", "T2", "T3", "T4", "T5", "T6"]:
-        event = nodes[key]
-        if event:
-            ts = event.timestamp.strftime("%m-%d %H:%M") if event.timestamp else "N/A"
-            node_strs.append(f"{key}({ts})")
-        else:
-            node_strs.append(f"{key}(-)")
-    print(f"    病程节点: {' -> '.join(node_strs)}")
-
-
-def demo_import_from_db(num_workers: int = 1):
-    """从 MySQL 数据库导入病例，并生成时间轴"""
     print("=" * 60)
-    print("数据库导入 + 时间轴解析")
+    print("构建向量索引")
     print("=" * 60)
 
     cfg = DBConfig.from_env()
     records = load_records_from_db(cfg)
 
     if not records:
-        print("未找到有效病例，请先用 migrate_xlsx_to_mysql.py 迁移数据")
+        print("未找到有效病历，请先运行 data_migrate/migrate_xlsx_to_mysql.py 导入原始数据")
         return
 
-    # 创建系统
-    system = create_system(data_dir="./data", threshold=0.45)
+    # 清空旧向量数据
+    store = MySQLVectorStore(cfg)
+    store.init_table()
+    store.delete_all()
 
-    # 导入前500个患者（测试用）
-    items = list(records.items())[:500]
-
-    print(f"\n开始导入 {len(items)} 个患者病例...")
-
-    # 批量导入（支持多进程并行）
-    batch = dict(items)
-    system.add_records_batch(batch, num_workers=num_workers)
+    # 分批并行处理：每 1000 条重建一次进程池，重置进程状态防止累积变慢
+    system = create_system(data_dir="./data", threshold=0.45, db_config=cfg)
+    items = list(records.items())
+    n = len(items)
+    batch_size = 200
+    print(f"\n从 medical_records 表读取到 {n} 个患者，开始分批处理 (batch={batch_size}, workers={num_workers})...")
+    if num_workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        executor = None
+        try:
+            for batch_start in range(0, n, batch_size):
+                batch_end = min(batch_start + batch_size, n)
+                batch = dict(items[batch_start:batch_end])
+                # 每 1000 条重建进程池，重置进程状态
+                if batch_start % 1000 == 0:
+                    if executor is not None:
+                        executor.shutdown(wait=True)
+                    executor = ProcessPoolExecutor(max_workers=num_workers)
+                    print(f"  [进程池已重置 @ {batch_start}]")
+                system.add_records_batch(batch, num_workers=num_workers, executor=executor)
+                print(f"  [{batch_end}/{n}] 条已入库 ({batch_end * 100 // n}%)")
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+    else:
+        for batch_start in range(0, n, batch_size):
+            batch_end = min(batch_start + batch_size, n)
+            batch = dict(items[batch_start:batch_end])
+            system.add_records_batch(batch, num_workers=num_workers)
+            print(f"  [{batch_end}/{n}] 条已入库 ({batch_end * 100 // n}%)")
     system.save()
 
-    print(f"\n导入完成！底库病例总数: {len(system.records)}")
-
-    # 为导入的病例生成时间轴
-    print("\n" + "-" * 60)
-    print("生成病例时间轴...")
-    print("-" * 60)
-
-    for record_id, text in list(batch.items())[:5]:
-        print_case_timeline(text, record_id)
-
-    if len(batch) > 5:
-        print(f"\n  ... 还有 {len(batch) - 5} 个病例（略）")
-
-    print("\n" + "=" * 60)
+    print(f"\n构建完成！record_vectors 表共 {store.count()} 条记录")
 
 
-def demo_search():
-    """检索相似病例，并对比时间轴"""
+def search():
+    """
+    search 模式：从 MySQL record_vectors 表加载预计算向量，检索相似病例。
+
+    适用场景：
+    - 日常使用，查询相似病例
+    - 查询病例文件放在 data/records/*.txt
+    - 结果输出到 data/检索结果.txt
+    """
     print("=" * 60)
-    print("相似病例检索 + 时间轴对比")
+    print("相似病例检索")
     print("=" * 60)
 
-    # 创建系统（加载已有索引）
     system = create_system(data_dir="./data", threshold=0.45)
 
-    print(f"底库病例总数: {len(system.records)}")
+    print(f"底库病例总数: {len(system.record_order)}")
 
-    if not system.records:
-        print("底库为空，请先运行导入")
+    if not system.record_order:
+        print("底库为空，请先运行: python main.py --mode build")
         return
 
-    # 扫描 data/records 下的 txt 文件作为查询
     query_records = scan_medical_records("./data/records")
 
     if not query_records:
@@ -132,7 +129,6 @@ def demo_search():
         print(f"查询文件: {filename}")
         print(f"{'='*60}")
 
-        # 查询病例时间轴
         query_events = timeline_parser.parse(query_text)
         query_nodes = timeline_parser.generate_standard_nodes(query_events)
         print(f"\n  查询病例时间轴节点:")
@@ -142,7 +138,6 @@ def demo_search():
                 ts = event.timestamp.strftime("%m-%d %H:%M") if event.timestamp else "N/A"
                 print(f"    {key}: [{ts}] {event.description[:50]}")
 
-        # 检索相似病例（排除查询文件自身）
         results = system.search(query_text, top_k=5, exclude_record_ids={filename})
         print(f"\n  检索结果（Top {len(results)}）:")
 
@@ -151,8 +146,7 @@ def demo_search():
             tl_sim = r.get('timeline_similarity', '-')
             print(f"\n  [{i}] {r['id']} (综合: {r['similarity']}, 向量: {vec_sim}, 病程: {tl_sim})")
 
-            # 获取匹配病例的文本并解析时间轴
-            matched_text = system.records.get(r['id'], {}).get('text', '')
+            matched_text = r.get('full_text', '')
             if matched_text:
                 matched_events = timeline_parser.parse(matched_text)
                 matched_nodes = timeline_parser.generate_standard_nodes(matched_events)
@@ -176,7 +170,7 @@ def demo_search():
                 'full_text': r['full_text']
             })
 
-    # 保存结果到文件
+    # 保存结果
     output_file = "data/检索结果.txt"
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write("病历相似度检索结果\n")
@@ -198,17 +192,15 @@ def demo_search():
 
 
 def main():
-    """主函数"""
     import argparse
 
     parser = argparse.ArgumentParser(description='病历相似度检索系统')
-    parser.add_argument('--mode', choices=['import', 'search'], default='search',
-                        help='import: 从数据库导入病例; search: 检索相似病例')
+    parser.add_argument('--mode', choices=['build', 'search'], default='search',
+                        help='build: 从原始病历构建向量索引入库; search: 检索相似病例（默认）')
     parser.add_argument('--workers', '-j', type=int, default=1,
-                        help='导入时并行处理的进程数（默认1=单进程，设为0则自动使用全部CPU核心）')
+                        help='build 时并行进程数（默认1，设为0则自动使用全部CPU核心）')
     args = parser.parse_args()
 
-    # 解析 workers 数量
     num_workers = args.workers
     if num_workers == 0:
         import multiprocessing
@@ -220,10 +212,10 @@ def main():
     print("╚" + "═" * 58 + "╝")
     print()
 
-    if args.mode == 'import':
-        demo_import_from_db(num_workers=num_workers)
+    if args.mode == 'build':
+        build_index(num_workers=num_workers)
     else:
-        demo_search()
+        search()
 
 
 if __name__ == "__main__":
