@@ -170,24 +170,27 @@ def search():
                 'full_text': r['full_text']
             })
 
-    # 保存结果
-    output_file = "data/检索结果.txt"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write("病历相似度检索结果\n")
-        f.write("=" * 80 + "\n\n")
+    # 按查询病例分组保存结果，每个查询一个文件
+    import os as _os
+    result_dir = "data/results"
+    _os.makedirs(result_dir, exist_ok=True)
 
-        for result in all_results:
-            f.write(f"查询文件: {result['query_file']}\n")
-            f.write(f"匹配病例: {result['matched_id']}\n")
-            f.write(f"综合相似度: {result['similarity']}\n")
-            f.write(f"向量相似度: {result.get('vector_similarity', '-')}\n")
-            f.write(f"病程相似度: {result.get('timeline_similarity', '-')}\n")
-            f.write("-" * 80 + "\n")
-            f.write(result['full_text'])
-            f.write("\n" + "=" * 80 + "\n\n")
+    for filename in query_records:
+        safe_name = filename.replace('.txt', '')
+        output_file = _os.path.join(result_dir, f"{safe_name}_结果.txt")
+        file_results = [r for r in all_results if r['query_file'] == filename]
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for result in file_results:
+                f.write(f"匹配病例: {result['matched_id']}\n")
+                f.write(f"综合相似度: {result['similarity']}\n")
+                f.write(f"向量相似度: {result.get('vector_similarity', '-')}\n")
+                f.write(f"病程相似度: {result.get('timeline_similarity', '-')}\n")
+                f.write("-" * 80 + "\n")
+                f.write(result['full_text'])
+                f.write("\n" + "=" * 80 + "\n\n")
 
-    print(f"\n检索结果已保存到: {output_file}")
-    print(f"共 {len(all_results)} 条结果")
+    print(f"\n检索结果已保存到: {result_dir}/")
+    print(f"共 {len(query_records)} 个查询，{len(all_results)} 条结果")
     print("=" * 60)
 
 
