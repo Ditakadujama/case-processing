@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from collections import Counter
 from retrieval_system import create_system
-from data_migrate.database import DBConfig
+from config import DBConfig
 from vector_store import MySQLVectorStore
 from record_parser import MedicalRecordParser
 from timeline_parser import TimelineParser
@@ -29,6 +29,20 @@ def main():
     all_ids = list(metadata.keys())
     print(f"底库总数: {total}")
 
+    # 自动检测 LLM 病例卡数据
+    from case_card_store import MySQLCaseCardStore
+    enable_llm = False
+    case_cards = {}
+    try:
+        cc_store = MySQLCaseCardStore(cfg)
+        cc_store.init_table()
+        if cc_store.count() > 0:
+            enable_llm = True
+            case_cards = cc_store.load_all()
+            print(f"检测到病例卡数据 ({cc_store.count()} 条)，启用 LLM 增强评测")
+    except Exception:
+        pass
+
     # 随机选 100 个
     random.seed(42)
     sample_size = min(100, total)
@@ -36,7 +50,8 @@ def main():
     print(f"随机选取 {sample_size} 个查询病例\n")
 
     # 初始化检索系统
-    system = create_system(data_dir="./data", threshold=0.0, db_config=cfg)  # 阈值设 0 不过滤
+    system = create_system(data_dir="./data", threshold=0.0, db_config=cfg,
+                          enable_llm=enable_llm)
     parser = MedicalRecordParser()
     timeline_parser = TimelineParser()
 
@@ -64,7 +79,15 @@ def main():
     vec_scores = []
     tl_scores = []
     text_scores = []
+    emb_scores = []
+    tag_scores = []
     final_scores = []
+
+    # Jaccard 指标（仅在 LLM 模式下可用）
+    diag_jaccards = []
+    interv_jaccards = []
+    organ_jaccards = []
+    compl_jaccards = []
 
     for idx, qid in enumerate(query_ids):
         qmeta = metadata.get(qid, {})
@@ -77,12 +100,35 @@ def main():
         # 检索（排除自身）
         results = system.search(qtext, top_k=5, exclude_record_ids={qid})
 
+        # 获取查询病例的病例卡（用于 Jaccard 计算）
+        q_card = case_cards.get(qid)
+
         # 提取各层分数
         for r in results:
             vec_scores.append(r.get('vector_similarity', r['similarity']))
             tl_scores.append(r.get('timeline_similarity', 0))
             text_scores.append(r.get('text_similarity', 0))
             final_scores.append(r['similarity'])
+
+            if enable_llm:
+                emb_sim = r.get('embedding_similarity', '-')
+                tag_sim = r.get('tag_overlap_similarity', '-')
+                if isinstance(emb_sim, (int, float)):
+                    emb_scores.append(emb_sim)
+                if isinstance(tag_sim, (int, float)):
+                    tag_scores.append(tag_sim)
+
+                # Jaccard 指标（查询 vs 候选）
+                if q_card:
+                    c_card = case_cards.get(r['id'])
+                    if c_card:
+                        from case_card import extract_tag_sets, jaccard_similarity
+                        q_diag, q_interv, q_compl, q_organ = extract_tag_sets(q_card)
+                        c_diag, c_interv, c_compl, c_organ = extract_tag_sets(c_card)
+                        diag_jaccards.append(jaccard_similarity(q_diag, c_diag))
+                        interv_jaccards.append(jaccard_similarity(q_interv, c_interv))
+                        compl_jaccards.append(jaccard_similarity(q_compl, c_compl))
+                        organ_jaccards.append(jaccard_similarity(q_organ, c_organ))
 
         # 手术类型命中率
         if q_surgery and q_surgery != 'other':
@@ -103,6 +149,8 @@ def main():
                  'vec': r.get('vector_similarity', r['similarity']),
                  'tl': r.get('timeline_similarity', 0),
                  'text': r.get('text_similarity', 0),
+                 'emb': r.get('embedding_similarity', '-'),
+                 'tag': r.get('tag_overlap_similarity', '-'),
                  'surgery': get_surgery_specialty(r['id'])}
                 for r in results
             ]
@@ -119,19 +167,51 @@ def main():
     # 1. 分数分布
     print(f"\n【分数分布】")
     import numpy as np
-    for name, scores in [("最终综合分", final_scores), ("向量相似度", vec_scores), ("病程相似度", tl_scores), ("摘要相似度", text_scores)]:
+    score_groups = [
+        ("最终综合分", final_scores),
+        ("向量相似度", vec_scores),
+        ("病程相似度", tl_scores),
+        ("摘要相似度", text_scores),
+    ]
+    if emb_scores:
+        score_groups.append(("病例卡语义相似度", emb_scores))
+    if tag_scores:
+        score_groups.append(("标签重叠相似度", tag_scores))
+
+    for name, scores in score_groups:
         arr = np.array(scores)
         print(f"  {name}: 均值={arr.mean():.4f}, 中位数={np.median(arr):.4f}, "
               f"std={arr.std():.4f}, min={arr.min():.4f}, max={arr.max():.4f}")
 
-    # 2. 向量 vs 病程 相关性
-    if vec_scores and tl_scores:
-        corr = np.corrcoef(vec_scores, tl_scores)[0, 1]
-        print(f"\n【向量-病程相关性】Pearson r = {corr:.4f}")
-        if corr < 0.3:
-            print("  → 向量和病程捕捉到不同的信号，两阶段互补性强")
-        else:
-            print("  → 向量和病程高度相关，两阶段冗余度较高")
+    # 2. 各分数相关性矩阵
+    print(f"\n【分数相关性矩阵】")
+    all_score_arrays = {
+        "向量": np.array(vec_scores),
+        "病程": np.array(tl_scores),
+        "摘要": np.array(text_scores),
+    }
+    if emb_scores:
+        all_score_arrays["语义"] = np.array(emb_scores)
+    if tag_scores:
+        all_score_arrays["标签"] = np.array(tag_scores)
+
+    names = list(all_score_arrays.keys())
+    print(f"  {'':>6}", end="")
+    for name in names:
+        print(f"{name:>8}", end="")
+    print()
+    for n1 in names:
+        print(f"  {n1:>6}", end="")
+        for n2 in names:
+            if n1 == n2:
+                print(f"  {'1.000':>6}", end="")
+            else:
+                try:
+                    corr = np.corrcoef(all_score_arrays[n1], all_score_arrays[n2])[0, 1]
+                    print(f"{corr:8.4f}", end="")
+                except Exception:
+                    print(f"  {'N/A':>6}", end="")
+        print()
 
     # 3. Top-1 分数分布
     top1_finals = [r['top5'][0]['final'] for r in all_results if r['top5']]
@@ -141,6 +221,13 @@ def main():
     print(f"  综合: 均值={np.mean(top1_finals):.4f}, 中位数={np.median(top1_finals):.4f}")
     print(f"  向量: 均值={np.mean(top1_vecs):.4f}, 中位数={np.median(top1_vecs):.4f}")
     print(f"  病程: 均值={np.mean(top1_tls):.4f}, 中位数={np.median(top1_tls):.4f}")
+    if enable_llm:
+        top1_embs = [r['top5'][0].get('emb', 0) for r in all_results if r['top5']]
+        top1_tags = [r['top5'][0].get('tag', 0) for r in all_results if r['top5']]
+        if top1_embs and isinstance(top1_embs[0], (int, float)):
+            print(f"  语义: 均值={np.mean(top1_embs):.4f}, 中位数={np.median(top1_embs):.4f}")
+        if top1_tags and isinstance(top1_tags[0], (int, float)):
+            print(f"  标签: 均值={np.mean(top1_tags):.4f}, 中位数={np.median(top1_tags):.4f}")
 
     # 4. Top-1 与 Top-2 的分数差（区分度）
     gaps = []
@@ -151,7 +238,9 @@ def main():
         print(f"\n【Top-1/Top-2 区分度】")
         print(f"  平均分差: {np.mean(gaps):.4f}, 中位数: {np.median(gaps):.4f}")
         small_gap = sum(1 for g in gaps if g < 0.02)
-        print(f"  分差 < 0.02 的查询: {small_gap}/{len(gaps)} ({small_gap*100/len(gaps):.1f}%) — 这些查询的 Top-1 不够突出")
+        medium_gap = sum(1 for g in gaps if g < 0.05)
+        print(f"  分差 < 0.02 的查询: {small_gap}/{len(gaps)} ({small_gap*100/len(gaps):.1f}%) — Top-1 不够突出")
+        print(f"  分差 < 0.05 的查询: {medium_gap}/{len(gaps)} ({medium_gap*100/len(gaps):.1f}%)")
 
     # 5. 手术类型命中率
     if surgery_query_count > 0:
@@ -160,9 +249,10 @@ def main():
         print(f"  Top-3:  {surgery_hit_at_3}/{surgery_query_count} = {surgery_hit_at_3*100/surgery_query_count:.1f}%")
         print(f"  Top-5:  {surgery_hit_at_5}/{surgery_query_count} = {surgery_hit_at_5*100/surgery_query_count:.1f}%")
 
-    # 6. 向量主导 vs 病程主导
+    # 6. 向量主导 vs 病程主导 vs 语义主导
+    tl_led = 0   # 病程排名第一但综合不是第一 → 病程纠偏成功
     vec_led = 0  # 向量排名第一但综合不是第一
-    tl_led = 0   # 病程排名第一但综合不是第一
+    emb_led = 0  # 语义排名第一但综合不是第一
     for r in all_results:
         top5 = r['top5']
         if len(top5) < 2:
@@ -170,24 +260,43 @@ def main():
         best_by_vec = max(top5, key=lambda x: x['vec'])
         best_by_tl = max(top5, key=lambda x: x['tl'])
         best_final = top5[0]
+
         if best_by_vec['id'] != best_final['id'] and best_by_tl['id'] == best_final['id']:
             tl_led += 1
         elif best_by_tl['id'] != best_final['id'] and best_by_vec['id'] == best_final['id']:
             vec_led += 1
-    print(f"\n【病程纠偏能力】")
+
+        # LLM 模式下也检查语义主导
+        if enable_llm and all(isinstance(t.get('emb'), (int, float)) for t in top5):
+            best_by_emb = max(top5, key=lambda x: x['emb'])
+            if best_by_emb['id'] == best_final['id'] and best_by_vec['id'] != best_final['id']:
+                emb_led += 1
+
+    print(f"\n【纠偏能力分析】")
     print(f"  病程反超向量夺 Top-1: {tl_led}/{len(all_results)} ({tl_led*100/len(all_results):.1f}%)")
     print(f"  向量保住 Top-1:       {vec_led}/{len(all_results)} ({vec_led*100/len(all_results):.1f}%)")
+    if enable_llm:
+        print(f"  语义主导 Top-1:       {emb_led}/{len(all_results)} ({emb_led*100/len(all_results):.1f}%)")
 
     # 7. 分数阈值分析
+    print(f"\n【Top-1 分数阈值分布】")
     above_07 = sum(1 for s in top1_finals if s >= 0.7)
     above_06 = sum(1 for s in top1_finals if s >= 0.6)
     above_05 = sum(1 for s in top1_finals if s >= 0.5)
-    print(f"\n【Top-1 分数阈值分布】")
     print(f"  ≥0.7: {above_07}/{len(top1_finals)} ({above_07*100/len(top1_finals):.1f}%)")
     print(f"  ≥0.6: {above_06}/{len(top1_finals)} ({above_06*100/len(top1_finals):.1f}%)")
     print(f"  ≥0.5: {above_05}/{len(top1_finals)} ({above_05*100/len(top1_finals):.1f}%)")
 
-    # 8. 部分样例展示
+    # 8. LLM 标签 Jaccard 指标
+    if diag_jaccards:
+        print(f"\n【标签 Jaccard 指标】（查询 vs Top-5 候选）")
+        for name, jaccs in [("诊断", diag_jaccards), ("关键干预", interv_jaccards),
+                             ("器官功能问题", organ_jaccards), ("并发症", compl_jaccards)]:
+            arr = np.array(jaccs)
+            print(f"  {name} Jaccard: 均值={arr.mean():.4f}, 中位数={np.median(arr):.4f}, "
+                  f"std={arr.std():.4f}, max={arr.max():.4f}")
+
+    # 9. 部分样例展示
     print(f"\n{'='*60}")
     print("样例展示（前 5 个查询的 Top-3）")
     print(f"{'='*60}")
@@ -196,7 +305,12 @@ def main():
         q_s = r['query_surgery'] or '-'
         print(f"\n查询: {qid} (手术: {q_s})")
         for i, t in enumerate(r['top5'][:3]):
-            print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} 向量={t['vec']:.4f} 病程={t['tl']:.4f} 摘要={t['text']:.4f} 手术={t['surgery'] or '-'}")
+            if enable_llm and isinstance(t.get('emb'), (int, float)):
+                print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} 向量={t['vec']:.4f} "
+                      f"病程={t['tl']:.4f} 语义={t['emb']:.4f} 标签={t['tag']:.4f} 手术={t['surgery'] or '-'}")
+            else:
+                print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} 向量={t['vec']:.4f} "
+                      f"病程={t['tl']:.4f} 摘要={t['text']:.4f} 手术={t['surgery'] or '-'}")
 
     print(f"\n{'='*60}")
     print("评测完成")

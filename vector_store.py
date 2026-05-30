@@ -10,7 +10,8 @@ import numpy as np
 import pymysql
 from pymysql.cursors import DictCursor
 
-from data_migrate.database import DBConfig, get_db_connection
+from config import DBConfig
+from data_migrate.database import get_db_connection
 
 logger = logging.getLogger(__name__)
 

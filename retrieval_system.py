@@ -18,7 +18,9 @@ from similarity_index import create_index, VectorIndex
 from timeline_parser import TimelineParser
 from timeline_similarity import TimelineSimilarityScorer, TimelineFeatures
 from vector_store import MySQLVectorStore
-from data_migrate.database import DBConfig
+from config import DBConfig, EmbeddingConfig
+from case_card import tag_overlap_score, find_common_and_diff_tags
+from embedding_index import EmbeddingService, cosine_similarity, batch_cosine_similarity
 
 
 SUMMARY_SECTIONS = (
@@ -128,7 +130,8 @@ class MedicalRecordSimilaritySystem:
                  index_path: Optional[str] = None,
                  alpha: float = 0.4,
                  min_timeline_score: float = 0.3,
-                 db_config: Optional[DBConfig] = None):
+                 db_config: Optional[DBConfig] = None,
+                 enable_llm: bool = False):
         """
         Args:
             similarity_threshold: 相似度阈值，低于此值的病例不返回
@@ -138,11 +141,13 @@ class MedicalRecordSimilaritySystem:
             alpha: 向量相似度权重 (0~1)；最终分数 = alpha*向量 + (1-alpha)*时间轴
             min_timeline_score: 时间轴相似度软惩罚阈值，低于此值时最终分数乘以0.5
             db_config: MySQL 连接配置（用于向量持久化）
+            enable_llm: 是否启用 LLM 病例卡 + embedding 增强检索
         """
         self.threshold = similarity_threshold
         self.index_path = index_path
         self.alpha = alpha
         self.min_timeline_score = min_timeline_score
+        self.enable_llm = enable_llm
 
         # 组件初始化
         self.parser = MedicalRecordParser()
@@ -163,6 +168,17 @@ class MedicalRecordSimilaritySystem:
         self.record_order: List[str] = []
         self.record_count = 0
 
+        # LLM 增强模块（懒初始化）
+        self._case_card_store = None
+        self._embedding_service: Optional[EmbeddingService] = None
+        self._case_card_cache: Dict[str, dict] = {}
+        self._embedding_cache: Optional[np.ndarray] = None  # (N, D) float32
+        self._embedding_ids: List[str] = []  # 与 _embedding_cache 行对齐
+        self._embedding_id_to_idx: Dict[str, int] = {}  # record_id → embedding 行索引
+
+        # LLM 抽取器（搜索时实时抽取查询病例卡）
+        self._llm_extractor = None
+
         # TF-IDF 向量器是否已训练
         self._extractor_fitted = False
 
@@ -180,6 +196,34 @@ class MedicalRecordSimilaritySystem:
             self._store = MySQLVectorStore(self._db_config)
             self._store.init_table()
         return self._store
+
+    def _get_case_card_store(self):
+        """懒初始化 MySQLCaseCardStore"""
+        if self._case_card_store is None:
+            from case_card_store import MySQLCaseCardStore
+            if self._db_config is None:
+                self._db_config = DBConfig.from_env()
+            self._case_card_store = MySQLCaseCardStore(self._db_config)
+            self._case_card_store.init_table()
+        return self._case_card_store
+
+    def _get_embedding_service(self) -> Optional[EmbeddingService]:
+        """懒初始化 EmbeddingService"""
+        if self._embedding_service is None and self.enable_llm:
+            cfg = EmbeddingConfig()
+            if cfg.is_configured:
+                self._embedding_service = EmbeddingService(cfg)
+        return self._embedding_service
+
+    def _get_llm_extractor(self):
+        """懒初始化 LLMCaseExtractor"""
+        if self._llm_extractor is None and self.enable_llm:
+            from llm_case_extractor import LLMCaseExtractor
+            from config import LLMConfig
+            cfg = LLMConfig()
+            if cfg.is_configured:
+                self._llm_extractor = LLMCaseExtractor(cfg)
+        return self._llm_extractor
 
     def _init_default_vocabulary(self) -> None:
         """初始化向量提取器（词袋模型不需要训练）"""
@@ -365,21 +409,73 @@ class MedicalRecordSimilaritySystem:
             surgery_keywords_hint=query_record.surgery_keywords or None
         )
 
-        # 第一阶段：向量检索，扩大候选池
+        # ── LLM 增强：查询病历实时抽取病例卡 + embedding ──
+        query_card = None
+        query_embedding = None
+
+        # 拆分为两个独立开关：有病例卡缓存  vs  有 embedding 缓存
+        has_case_cards = self.enable_llm and bool(self._case_card_cache)
+        has_embeddings = self.enable_llm and self._embedding_cache is not None and len(self._embedding_ids) > 0
+
+        if self.enable_llm:
+            extractor = self._get_llm_extractor()
+            emb_service = self._get_embedding_service()
+            if extractor and extractor.is_available:
+                try:
+                    query_card = extractor.extract(query_text, record_id="__query__")
+                except Exception as e:
+                    print(f"  查询病例卡抽取失败: {e}，回退到原融合公式")
+                    query_card = None
+
+            if query_card and emb_service and emb_service.is_available:
+                try:
+                    summary = query_card.get("summary_for_embedding", "")
+                    if summary:
+                        query_embedding = emb_service.embed_text(summary)
+                        # ── P0-2: 查询 embedding 归一化 ──
+                        query_embedding = query_embedding.astype(np.float64)
+                        norm = np.linalg.norm(query_embedding)
+                        if norm > 0:
+                            query_embedding = query_embedding / norm
+                except Exception as e:
+                    print(f"  查询 embedding 生成失败: {e}")
+                    query_embedding = None
+
+        # ── 第一阶段：多路候选召回 ──
+        # 1. 结构化向量候选
         vector_top_k = min(max(top_k * 20, 100), len(self.record_order))
         distances, indices = self.index.search(query_features, vector_top_k)
 
-        # 第二阶段：时间轴相似度重排序
-        candidates = []
+        vector_candidate_indices = set()
+        vector_score_by_id = {}
         for dist, idx in zip(distances[0], indices[0]):
-            if idx < 0 or idx >= len(self.record_order):
-                continue
+            if 0 <= idx < len(self.record_order):
+                rid = self.record_order[idx]
+                vector_candidate_indices.add(rid)
+                vector_score_by_id[rid] = self._distance_to_similarity(dist)
 
-            record_id = self.record_order[idx]
-            if record_id in exclude_record_ids:
-                continue
+        # 2. embedding 候选（P0-1: embedding 参与召回）
+        embedding_candidate_ids = set()
+        embedding_score_by_id = {}
+        if has_embeddings and query_embedding is not None:
+            emb_scores = np.dot(self._embedding_cache, query_embedding)
+            emb_top_k = min(max(top_k * 20, 100), len(self._embedding_ids))
+            emb_top_indices = np.argsort(-emb_scores)[:emb_top_k]
+            for ei in emb_top_indices:
+                emb_id = self._embedding_ids[ei]
+                embedding_candidate_ids.add(emb_id)
+                embedding_score_by_id[emb_id] = float(emb_scores[ei])
 
-            vector_sim = self._distance_to_similarity(dist)
+        # 3. 合并候选集合（并集）
+        candidate_ids = set(vector_candidate_indices)
+        candidate_ids.update(embedding_candidate_ids)
+        candidate_ids -= exclude_record_ids
+
+        # ── 第二阶段：多维度重排序 ──
+        candidates = []
+        for record_id in candidate_ids:
+            # 结构化向量分：候选来自 embedding 但没有向量分时用 0.0
+            vector_sim = vector_score_by_id.get(record_id, 0.0)
 
             cand_data = self._metadata_cache.get(record_id, {})
             text = cand_data.get('text', '')
@@ -393,18 +489,74 @@ class MedicalRecordSimilaritySystem:
 
             text_sim = self._text_similarity(record_id, text, query_summary_vec)
 
-            final_sim = (
-                0.30 * vector_sim +
-                0.45 * timeline_sim +
-                0.25 * text_sim
-            )
+            # ── LLM 增强相似度 ──
+            embedding_sim = 0.0
+            tag_overlap_sim = 0.0
+
+            # Embedding 相似度（P0-2: 查询已归一化，候选也预归一化，点积即余弦）
+            if has_embeddings and query_embedding is not None:
+                if record_id in embedding_score_by_id:
+                    # 从缓存取（embedding 召回阶段已计算）
+                    embedding_sim = embedding_score_by_id[record_id]
+                elif record_id in self._embedding_id_to_idx:
+                    emb_idx = self._embedding_id_to_idx[record_id]
+                    cand_emb = self._embedding_cache[emb_idx]
+                    embedding_sim = float(np.dot(cand_emb, query_embedding))
+                else:
+                    # 候选无 embedding，回退到字符 n-gram
+                    embedding_sim = text_sim
+                embedding_sim = min(1.0, max(0.0, embedding_sim))
+            else:
+                # 无 embedding，使用字符 n-gram
+                embedding_sim = text_sim
+
+            # 标签重叠相似度（P1-6: 与 embedding 解耦，独立判断）
+            if has_case_cards and query_card is not None:
+                cand_card = self._case_card_cache.get(record_id)
+                if cand_card:
+                    tag_overlap_sim = tag_overlap_score(query_card, cand_card)
+
+            # ── 融合公式（P1-6: 按可用信号灵活组合）──
+            use_embedding = has_embeddings and query_embedding is not None
+            use_tag = has_case_cards and query_card is not None
+
+            if use_embedding and use_tag:
+                # 完整四路融合
+                final_sim = (
+                    0.15 * vector_sim +
+                    0.40 * timeline_sim +
+                    0.35 * embedding_sim +
+                    0.10 * tag_overlap_sim
+                )
+            elif use_embedding:
+                # 有 embedding 但无标签
+                final_sim = (
+                    0.18 * vector_sim +
+                    0.42 * timeline_sim +
+                    0.40 * embedding_sim
+                )
+            elif use_tag:
+                # 有病例卡标签但无 embedding
+                final_sim = (
+                    0.20 * vector_sim +
+                    0.45 * timeline_sim +
+                    0.20 * text_sim +
+                    0.15 * tag_overlap_sim
+                )
+            else:
+                # 原始三路融合
+                final_sim = (
+                    0.30 * vector_sim +
+                    0.45 * timeline_sim +
+                    0.25 * text_sim
+                )
 
             if timeline_sim < self.min_timeline_score:
                 final_sim *= 0.5
             final_sim = min(1.0, max(0.0, final_sim))
 
             if final_sim >= self.threshold:
-                candidates.append({
+                result = {
                     'id': record_id,
                     'similarity': round(final_sim, 4),
                     'vector_similarity': round(vector_sim, 4),
@@ -412,7 +564,22 @@ class MedicalRecordSimilaritySystem:
                     'text_similarity': round(text_sim, 4),
                     'text': text[:200] + "..." if len(text) > 200 else text,
                     'full_text': text,
-                })
+                }
+
+                # LLM 增强时附加额外字段
+                if use_tag or use_embedding:
+                    result['embedding_similarity'] = round(embedding_sim, 4)
+                    result['tag_overlap_similarity'] = round(tag_overlap_sim, 4)
+                    # 相似原因
+                    if query_card:
+                        cand_card = self._case_card_cache.get(record_id)
+                        if cand_card:
+                            result['similarity_reasons'] = find_common_and_diff_tags(query_card, cand_card)
+                else:
+                    result['embedding_similarity'] = '-'
+                    result['tag_overlap_similarity'] = '-'
+
+                candidates.append(result)
 
         candidates.sort(key=lambda x: x['similarity'], reverse=True)
         return candidates[:top_k], query_record, query_features, query_timeline_features
@@ -528,6 +695,43 @@ class MedicalRecordSimilaritySystem:
 
         print(f"从 MySQL 加载了 {len(ids)} 条记录")
 
+        # 如果启用 LLM，加载病例卡和 embedding
+        if self.enable_llm:
+            self._load_case_cards()
+
+    def _load_case_cards(self) -> None:
+        """加载病例卡和 embedding 到内存缓存"""
+        try:
+            cc_store = self._get_case_card_store()
+            card_count = cc_store.count()
+            if card_count == 0:
+                print("病例卡表为空，LLM 增强功能不可用")
+                self.enable_llm = False
+                return
+
+            # 加载病例卡（P1-6: 与 embedding 解耦，独立加载）
+            self._case_card_cache = cc_store.load_all()
+            print(f"加载了 {len(self._case_card_cache)} 条病例卡")
+
+            # 加载 embedding 向量
+            emb_vectors, emb_ids = cc_store.load_all_embeddings()
+            if emb_vectors.size > 0:
+                self._embedding_cache = emb_vectors
+                self._embedding_ids = emb_ids
+                self._embedding_id_to_idx = {rid: i for i, rid in enumerate(emb_ids)}
+                print(f"加载了 {len(emb_ids)} 条 embedding 向量 (维度={emb_vectors.shape[1]})")
+
+                # 预归一化所有候选 embedding，加速后续余弦相似度计算
+                norms = np.linalg.norm(emb_vectors, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                self._embedding_cache = emb_vectors / norms
+            else:
+                # P1-6: embedding 缺失不阻止标签融合
+                print("embedding 向量为空，标签重叠相似度仍可用（如已加载病例卡）")
+        except Exception as e:
+            print(f"加载病例卡失败: {e}，LLM 增强功能不可用")
+            self.enable_llm = False
+
     def get_stats(self) -> Dict:
         """获取系统统计信息"""
         return {
@@ -544,7 +748,8 @@ class MedicalRecordSimilaritySystem:
 
 def create_system(data_dir: str = "./data",
                   threshold: float = 0.45,
-                  db_config: Optional[DBConfig] = None) -> MedicalRecordSimilaritySystem:
+                  db_config: Optional[DBConfig] = None,
+                  enable_llm: bool = False) -> MedicalRecordSimilaritySystem:
     """
     工厂函数：创建检索系统
 
@@ -552,6 +757,7 @@ def create_system(data_dir: str = "./data",
         data_dir: 数据存储目录
         threshold: 相似度阈值
         db_config: MySQL 连接配置（若不提供则从环境变量读取）
+        enable_llm: 是否启用 LLM 病例卡 + embedding 增强
 
     Returns:
         MedicalRecordSimilaritySystem 实例
@@ -566,6 +772,7 @@ def create_system(data_dir: str = "./data",
         similarity_threshold=threshold,
         index_path=index_path,
         db_config=db_config,
+        enable_llm=enable_llm,
     )
 
 

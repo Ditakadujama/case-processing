@@ -18,38 +18,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DBConfig:
-    """MySQL 连接配置"""
-    host: str = "localhost"
-    port: int = 3306
-    user: str = "root"
-    password: str = "1887415157Oxx/"
-    database: str = "medical_records"
-    charset: str = "utf8mb4"
-
-    @classmethod
-    def from_env(cls) -> "DBConfig":
-        """从环境变量读取配置（未设置的环境变量使用类默认值）"""
-        cfg = cls()
-        cfg.host = os.getenv("DB_HOST", cfg.host)
-        cfg.port = int(os.getenv("DB_PORT", str(cfg.port)))
-        cfg.user = os.getenv("DB_USER", cfg.user)
-        cfg.password = os.getenv("DB_PASSWORD", cfg.password)
-        cfg.database = os.getenv("DB_NAME", cfg.database)
-        return cfg
-
-    def to_connection_kwargs(self) -> dict:
-        """转换为 pymysql.connect 参数"""
-        return {
-            "host": self.host,
-            "port": self.port,
-            "user": self.user,
-            "password": self.password,
-            "database": self.database,
-            "charset": self.charset,
-            "cursorclass": DictCursor,
-        }
+# 数据库配置已迁移到项目根目录 config.py，此处保留别名以兼容旧导入路径
+from config import DBConfig  # noqa: F401  # 向后兼容，新代码请用 from config import DBConfig
 
 
 @contextmanager
@@ -65,7 +35,9 @@ def get_db_connection(cfg: DBConfig):
     """
     conn = None
     try:
-        conn = pymysql.connect(**cfg.to_connection_kwargs())
+        kwargs = cfg.to_connection_kwargs()
+        kwargs.setdefault("cursorclass", DictCursor)
+        conn = pymysql.connect(**kwargs)
         yield conn
     except pymysql.MySQLError as e:
         logger.error(f"数据库连接失败: {e}")
