@@ -102,22 +102,16 @@ class FeatureExtractor:
             self.idf_weights = None
             return []
 
-        N = len(records)
-        df = np.zeros(self.total_dim)
         raw_vectors = []
 
         for record in records:
             vec = self._extract_raw_vector(record)
             raw_vectors.append(vec)
-            df += (vec > 0).astype(float)
 
-        # 计算 IDF: log(N / df)，至少为 1.0（平滑）
-        idf = np.log(N / (df + 1e-8))
-        idf = np.maximum(idf, 0.0)
-        # 对于完全没有出现的维度，给一个基础权重 1.0
-        idf = np.where(df > 0, idf + 1.0, 1.0)
-
-        self.idf_weights = idf
+        # 固定词表的结构化特征需要跨批次、跨查询保持同一尺度。
+        # 旧实现按 build batch 计算 IDF，会导致不同批次入库向量不可比；
+        # 这里保留 fit() 接口，但不再引入 batch 相关权重。
+        self.idf_weights = None
         return raw_vectors
 
     def _extract_raw_vector(self, record: MedicalRecord) -> np.ndarray:

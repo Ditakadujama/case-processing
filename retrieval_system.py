@@ -6,6 +6,8 @@
 from typing import List, Dict, Optional, Tuple
 import json
 import os
+import re
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -17,6 +19,24 @@ from timeline_parser import TimelineParser
 from timeline_similarity import TimelineSimilarityScorer, TimelineFeatures
 from vector_store import MySQLVectorStore
 from data_migrate.database import DBConfig
+
+
+SUMMARY_SECTIONS = (
+    "chief_complaint", "主诉",
+    "history_illness", "现病史",
+    "inspection_visit", "查房记录",
+    "surgery_record", "手术记录",
+    "operation_record",
+    "examine", "检查",
+)
+
+SUMMARY_KEYWORDS = (
+    "入院诊断", "目前诊断", "出院诊断", "术后诊断", "主诉", "现病史",
+    "手术名称", "手术日期", "机械通气", "气管插管", "呼吸机", "CRRT",
+    "血滤", "IABP", "主动脉内球囊反搏", "休克", "感染", "呼吸衰竭",
+    "心力衰竭", "肾功能不全", "肾衰竭", "血栓", "出血", "肺部感染",
+    "多器官功能", "死亡", "转出", "转入",
+)
 
 
 # ── 模块级 worker 函数（供 ProcessPoolExecutor 使用）─────────────────────
@@ -40,6 +60,55 @@ def _worker_parse_timeline(item):
                                         surgery_type_hint=surgery_type or None,
                                         surgery_keywords_hint=surgery_keywords or None)
     return record_id, events, nodes, features
+
+
+def _extract_summary_text(text: str, limit: int = 6000) -> str:
+    """抽取面向相似病例召回的临床摘要文本，避免监测/医嘱噪声主导。"""
+    chunks = []
+    section_set = set(SUMMARY_SECTIONS)
+    for section_name, content in re.findall(r"###([^：:\n]+)[：:]?(.*?)(?=###[^\n]|\Z)", text, flags=re.DOTALL):
+        if section_name.strip() in section_set and content:
+            chunks.append(content[:1200])
+
+    for kw in SUMMARY_KEYWORDS:
+        start = 0
+        hits = 0
+        while hits < 4:
+            idx = text.find(kw, start)
+            if idx < 0:
+                break
+            chunks.append(text[max(0, idx - 80):idx + 240])
+            start = idx + len(kw)
+            hits += 1
+
+    summary = "\n".join(chunks) if chunks else text[:limit]
+    summary = re.sub(r"\s+", " ", summary)
+    return summary[:limit]
+
+
+def _char_ngram_vector(text: str, ngram_range: Tuple[int, int] = (2, 4)) -> Counter:
+    """中文友好的轻量文本向量：字符 n-gram 计数。"""
+    compact = re.sub(r"\s+", "", text)
+    vec = Counter()
+    for n in range(ngram_range[0], ngram_range[1] + 1):
+        if len(compact) < n:
+            continue
+        for i in range(len(compact) - n + 1):
+            vec[compact[i:i + n]] += 1
+    return vec
+
+
+def _counter_cosine(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    if len(a) > len(b):
+        a, b = b, a
+    dot = sum(v * b.get(k, 0) for k, v in a.items())
+    norm_a = sum(v * v for v in a.values()) ** 0.5
+    norm_b = sum(v * v for v in b.values()) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(dot / (norm_a * norm_b))
 
 
 class MedicalRecordSimilaritySystem:
@@ -89,6 +158,8 @@ class MedicalRecordSimilaritySystem:
 
         # 元数据缓存：{record_id: {text, timeline_features}}，启动时加载
         self._metadata_cache: Dict[str, Dict] = {}
+        self._summary_vector_cache: Dict[str, Counter] = {}
+        self._timeline_refreshed_ids: set = set()
         self.record_order: List[str] = []
         self.record_count = 0
 
@@ -278,11 +349,12 @@ class MedicalRecordSimilaritySystem:
         if not self.record_order:
             return [], None, None, None
 
-        exclude_record_ids = exclude_record_ids or set()
+        exclude_record_ids = self._normalize_record_ids(exclude_record_ids or set())
 
         # 解析查询病历
         query_record = self.parser.parse(query_text)
         query_features = self.extractor.extract(query_record).reshape(1, -1)
+        query_summary_vec = _char_ngram_vector(_extract_summary_text(query_text))
 
         # 解析查询病历的时间轴（传入手术类型）
         query_events = self.timeline_parser.parse(query_text)
@@ -310,24 +382,34 @@ class MedicalRecordSimilaritySystem:
             vector_sim = self._distance_to_similarity(dist)
 
             cand_data = self._metadata_cache.get(record_id, {})
-            cand_timeline_features = cand_data.get('timeline_features')
+            text = cand_data.get('text', '')
+            cand_timeline_features = self._timeline_features_for_candidate(
+                record_id, text, cand_data.get('timeline_features')
+            )
             if cand_timeline_features is not None:
                 timeline_sim = self.timeline_scorer.score(query_timeline_features, cand_timeline_features)
             else:
                 timeline_sim = vector_sim
 
-            final_sim = self.alpha * vector_sim + (1.0 - self.alpha) * timeline_sim
+            text_sim = self._text_similarity(record_id, text, query_summary_vec)
+
+            final_sim = (
+                0.30 * vector_sim +
+                0.45 * timeline_sim +
+                0.25 * text_sim
+            )
 
             if timeline_sim < self.min_timeline_score:
                 final_sim *= 0.5
+            final_sim = min(1.0, max(0.0, final_sim))
 
             if final_sim >= self.threshold:
-                text = cand_data.get('text', '')
                 candidates.append({
                     'id': record_id,
                     'similarity': round(final_sim, 4),
                     'vector_similarity': round(vector_sim, 4),
                     'timeline_similarity': round(timeline_sim, 4),
+                    'text_similarity': round(text_sim, 4),
                     'text': text[:200] + "..." if len(text) > 200 else text,
                     'full_text': text,
                 })
@@ -365,6 +447,51 @@ class MedicalRecordSimilaritySystem:
         使用余弦相似度: similarity = 1 - distance
         """
         return max(0.0, 1.0 - distance)
+
+    @staticmethod
+    def _normalize_record_ids(record_ids: set) -> set:
+        normalized = set()
+        for rid in record_ids:
+            if not rid:
+                continue
+            rid_str = str(rid)
+            normalized.add(rid_str)
+            normalized.add(os.path.splitext(rid_str)[0])
+        return normalized
+
+    def _text_similarity(self, record_id: str, text: str, query_summary_vec: Counter) -> float:
+        if not text:
+            return 0.0
+        cand_vec = self._summary_vector_cache.get(record_id)
+        if cand_vec is None:
+            cand_vec = _char_ngram_vector(_extract_summary_text(text))
+            self._summary_vector_cache[record_id] = cand_vec
+        return _counter_cosine(query_summary_vec, cand_vec)
+
+    def _timeline_features_for_candidate(self, record_id: str, text: str, existing_features):
+        """补齐旧索引中缺失的新版病程特征，避免不重建索引时评分失真。"""
+        if existing_features is None or not text:
+            return existing_features
+
+        has_new_fields = any((
+            getattr(existing_features, 'intervention_keywords', None),
+            getattr(existing_features, 'complication_keywords', None),
+            getattr(existing_features, 'severity_keywords', None),
+        ))
+        if has_new_fields or record_id in self._timeline_refreshed_ids:
+            return existing_features
+
+        events = self.timeline_parser.parse(text)
+        nodes = self.timeline_parser.generate_standard_nodes(events)
+        parsed = self.parser.parse(text)
+        refreshed = self.timeline_scorer.extract_features(
+            events, nodes,
+            surgery_type_hint=parsed.surgery_type or None,
+            surgery_keywords_hint=parsed.surgery_keywords or None
+        )
+        self._metadata_cache.setdefault(record_id, {})['timeline_features'] = refreshed
+        self._timeline_refreshed_ids.add(record_id)
+        return refreshed
 
     def _save_index(self) -> None:
         """保存轻量配置文件（向量数据已通过 MySQL 持久化）"""

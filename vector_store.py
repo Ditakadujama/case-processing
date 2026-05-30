@@ -39,6 +39,9 @@ def _serialize_timeline_features(tf) -> dict:
         'event_type_sequence': tf.event_type_sequence,
         'surgery_type': tf.surgery_type,
         'surgery_keywords': list(tf.surgery_keywords) if tf.surgery_keywords else [],
+        'intervention_keywords': list(getattr(tf, 'intervention_keywords', [])) if getattr(tf, 'intervention_keywords', None) else [],
+        'complication_keywords': list(getattr(tf, 'complication_keywords', [])) if getattr(tf, 'complication_keywords', None) else [],
+        'severity_keywords': list(getattr(tf, 'severity_keywords', [])) if getattr(tf, 'severity_keywords', None) else [],
     }
 
 
@@ -55,6 +58,9 @@ def _deserialize_timeline_features(data: dict):
         event_type_sequence=data.get('event_type_sequence', []),
         surgery_type=data.get('surgery_type'),
         surgery_keywords=set(data.get('surgery_keywords', [])),
+        intervention_keywords=set(data.get('intervention_keywords', [])),
+        complication_keywords=set(data.get('complication_keywords', [])),
+        severity_keywords=set(data.get('severity_keywords', [])),
     )
 
 

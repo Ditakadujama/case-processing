@@ -63,6 +63,7 @@ def main():
 
     vec_scores = []
     tl_scores = []
+    text_scores = []
     final_scores = []
 
     for idx, qid in enumerate(query_ids):
@@ -80,6 +81,7 @@ def main():
         for r in results:
             vec_scores.append(r.get('vector_similarity', r['similarity']))
             tl_scores.append(r.get('timeline_similarity', 0))
+            text_scores.append(r.get('text_similarity', 0))
             final_scores.append(r['similarity'])
 
         # 手术类型命中率
@@ -100,6 +102,7 @@ def main():
                 {'id': r['id'], 'final': r['similarity'],
                  'vec': r.get('vector_similarity', r['similarity']),
                  'tl': r.get('timeline_similarity', 0),
+                 'text': r.get('text_similarity', 0),
                  'surgery': get_surgery_specialty(r['id'])}
                 for r in results
             ]
@@ -116,7 +119,7 @@ def main():
     # 1. 分数分布
     print(f"\n【分数分布】")
     import numpy as np
-    for name, scores in [("最终综合分", final_scores), ("向量相似度", vec_scores), ("病程相似度", tl_scores)]:
+    for name, scores in [("最终综合分", final_scores), ("向量相似度", vec_scores), ("病程相似度", tl_scores), ("摘要相似度", text_scores)]:
         arr = np.array(scores)
         print(f"  {name}: 均值={arr.mean():.4f}, 中位数={np.median(arr):.4f}, "
               f"std={arr.std():.4f}, min={arr.min():.4f}, max={arr.max():.4f}")
@@ -193,7 +196,7 @@ def main():
         q_s = r['query_surgery'] or '-'
         print(f"\n查询: {qid} (手术: {q_s})")
         for i, t in enumerate(r['top5'][:3]):
-            print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} 向量={t['vec']:.4f} 病程={t['tl']:.4f} 手术={t['surgery'] or '-'}")
+            print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} 向量={t['vec']:.4f} 病程={t['tl']:.4f} 摘要={t['text']:.4f} 手术={t['surgery'] or '-'}")
 
     print(f"\n{'='*60}")
     print("评测完成")

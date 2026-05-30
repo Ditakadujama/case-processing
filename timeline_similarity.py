@@ -45,6 +45,20 @@ EVENT_WEIGHTS = {
     "follow_up": 0.6,
 }
 
+INTERVENTION_KEYWORDS = {
+    "机械通气", "气管插管", "呼吸机", "CRRT", "血滤", "IABP",
+    "主动脉内球囊反搏", "PICCO", "PiCCO", "升压", "抗生素升级",
+    "去甲肾上腺素", "肾上腺素", "多巴胺", "多巴酚丁胺",
+    "血管活性药物", "手术", "置管", "引流", "输血", "白蛋白",
+}
+
+COMPLICATION_KEYWORDS = {
+    "出血", "血栓", "感染", "肺部感染", "呼吸衰竭", "肾功能不全",
+    "肾衰竭", "心力衰竭", "心衰", "休克", "脓毒症", "败血症",
+    "多器官功能衰竭", "多器官功能障碍", "恶性心律失常", "脑梗死",
+    "脑出血", "消化道出血", "肺栓塞", "死亡",
+}
+
 # 手术类型关键词集（用于提取手术名称中的关键词）
 SURGERY_TYPE_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     k: tuple(v) for k, v in SURGERY_TYPE_RULES
@@ -61,17 +75,21 @@ class TimelineFeatures:
     event_type_sequence: List[str]      # 按时间排序的事件类型序列
     surgery_type: Optional[str] = None  # 手术专科类型（由 record_parser 提供）
     surgery_keywords: Set[str] = field(default_factory=set)  # 手术名称关键词
+    intervention_keywords: Set[str] = field(default_factory=set)  # 关键治疗/支持手段
+    complication_keywords: Set[str] = field(default_factory=set)  # 并发症/病情恶化信号
+    severity_keywords: Set[str] = field(default_factory=set)      # 器官功能和危重程度信号
 
 
 class TimelineSimilarityScorer:
     """病程相似度评分器（基于就诊计数模型）"""
 
     def __init__(self,
-                 weight_visit_scale: float = 0.20,
-                 weight_time_span: float = 0.15,
-                 weight_diag: float = 0.20,
-                 weight_seq: float = 0.20,
-                 weight_surgery_type: float = 0.25,
+                 weight_visit_scale: float = 0.12,
+                 weight_time_span: float = 0.08,
+                 weight_diag: float = 0.18,
+                 weight_seq: float = 0.17,
+                 weight_surgery_type: float = 0.20,
+                 weight_clinical_state: float = 0.25,
                  max_span_days: float = 3650.0):  # 10 年
         self.weights = {
             'visit_scale': weight_visit_scale,
@@ -79,8 +97,16 @@ class TimelineSimilarityScorer:
             'diag': weight_diag,
             'seq': weight_seq,
             'surgery_type': weight_surgery_type,
+            'clinical_state': weight_clinical_state,
         }
         self.max_span_days = max_span_days
+        self.severity_terms = {
+            "机械通气", "气管插管", "呼吸机", "CRRT", "血滤", "IABP",
+            "主动脉内球囊反搏", "休克", "心源性休克", "感染性休克",
+            "肾功能不全", "肾衰竭", "呼吸衰竭", "心力衰竭", "心衰",
+            "多器官功能衰竭", "多器官功能障碍", "乳酸", "氧合指数",
+            "去甲肾上腺素", "肾上腺素", "升压", "血管活性药物",
+        }
 
     def extract_features(self,
                          events: List[TimelineEvent],
@@ -173,6 +199,21 @@ class TimelineSimilarityScorer:
         if surgery_keywords_hint:
             surgery_keywords.update(surgery_keywords_hint)
 
+        intervention_keywords: Set[str] = set()
+        complication_keywords: Set[str] = set()
+        severity_keywords: Set[str] = set()
+        for e in events:
+            text_to_search = e.description + " " + e.raw_text
+            for kw in INTERVENTION_KEYWORDS:
+                if kw in text_to_search:
+                    intervention_keywords.add(kw)
+            for kw in COMPLICATION_KEYWORDS:
+                if kw in text_to_search:
+                    complication_keywords.add(kw)
+            for kw in self.severity_terms:
+                if kw in text_to_search:
+                    severity_keywords.add(kw)
+
         return TimelineFeatures(
             visit_count=visit_count,
             total_span_days=total_span_days,
@@ -181,6 +222,9 @@ class TimelineSimilarityScorer:
             event_type_sequence=seq,
             surgery_type=surgery_type,
             surgery_keywords=surgery_keywords,
+            intervention_keywords=intervention_keywords,
+            complication_keywords=complication_keywords,
+            severity_keywords=severity_keywords,
         )
 
     @staticmethod
@@ -223,15 +267,19 @@ class TimelineSimilarityScorer:
         # 5. 手术类型匹配
         score_surgery = self._surgery_type_score(query, candidate)
 
+        # 6. 临床状态匹配：关键支持手段、并发症、危重程度
+        score_clinical = self._clinical_state_score(query, candidate)
+
         # 加权求和
         total = (
             self.weights['visit_scale'] * score_visit +
             self.weights['time_span'] * score_span +
             self.weights['diag'] * score_diag +
             self.weights['seq'] * score_seq +
-            self.weights['surgery_type'] * score_surgery
+            self.weights['surgery_type'] * score_surgery +
+            self.weights['clinical_state'] * score_clinical
         )
-        return float(total)
+        return float(min(1.0, max(0.0, total)))
 
     def _surgery_type_score(self, query: TimelineFeatures, candidate: TimelineFeatures) -> float:
         """手术类型软匹配分数（基于 Jaccard 关键词重叠）"""
@@ -254,7 +302,7 @@ class TimelineSimilarityScorer:
 
         # 双方同类型
         if has_q and has_c and query.surgery_type == candidate.surgery_type:
-            return 1.0 + min(0.2, kw_jaccard * 0.3)
+            return 0.85 + 0.15 * kw_jaccard
 
         # 双方不同类型 → 关键词软回退
         if has_q and has_c and query.surgery_type != candidate.surgery_type:
@@ -262,6 +310,23 @@ class TimelineSimilarityScorer:
 
         # 一方有类型、一方无 → 关键词作为桥梁
         return kw_jaccard * 0.8
+
+    def _clinical_state_score(self, query: TimelineFeatures, candidate: TimelineFeatures) -> float:
+        """比较关键干预、并发症和危重程度信号。"""
+        scores = [
+            self._jaccard_or_neutral(query.intervention_keywords, candidate.intervention_keywords, neutral=0.4),
+            self._jaccard_or_neutral(query.complication_keywords, candidate.complication_keywords, neutral=0.5),
+            self._jaccard_or_neutral(query.severity_keywords, candidate.severity_keywords, neutral=0.4),
+        ]
+        return float(0.45 * scores[0] + 0.25 * scores[1] + 0.30 * scores[2])
+
+    @staticmethod
+    def _jaccard_or_neutral(a: Set[str], b: Set[str], neutral: float) -> float:
+        if not a and not b:
+            return neutral
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
 
     @staticmethod
     def _weighted_lcs_similarity(seq_a: List[str], seq_b: List[str]) -> float:

@@ -138,13 +138,15 @@ def search():
                 ts = event.timestamp.strftime("%m-%d %H:%M") if event.timestamp else "N/A"
                 print(f"    {key}: [{ts}] {event.description[:50]}")
 
-        results = system.search(query_text, top_k=5, exclude_record_ids={filename})
+        query_id = os.path.splitext(filename)[0]
+        results = system.search(query_text, top_k=5, exclude_record_ids={filename, query_id})
         print(f"\n  检索结果（Top {len(results)}）:")
 
         for i, r in enumerate(results, 1):
             vec_sim = r.get('vector_similarity', r['similarity'])
             tl_sim = r.get('timeline_similarity', '-')
-            print(f"\n  [{i}] {r['id']} (综合: {r['similarity']}, 向量: {vec_sim}, 病程: {tl_sim})")
+            txt_sim = r.get('text_similarity', '-')
+            print(f"\n  [{i}] {r['id']} (综合: {r['similarity']}, 向量: {vec_sim}, 病程: {tl_sim}, 摘要: {txt_sim})")
 
             matched_text = r.get('full_text', '')
             if matched_text:
@@ -167,6 +169,7 @@ def search():
                 'similarity': r['similarity'],
                 'vector_similarity': r.get('vector_similarity', r['similarity']),
                 'timeline_similarity': r.get('timeline_similarity', '-'),
+                'text_similarity': r.get('text_similarity', '-'),
                 'full_text': r['full_text']
             })
 
@@ -185,6 +188,7 @@ def search():
                 f.write(f"综合相似度: {result['similarity']}\n")
                 f.write(f"向量相似度: {result.get('vector_similarity', '-')}\n")
                 f.write(f"病程相似度: {result.get('timeline_similarity', '-')}\n")
+                f.write(f"摘要相似度: {result.get('text_similarity', '-')}\n")
                 f.write("-" * 80 + "\n")
                 f.write(result['full_text'])
                 f.write("\n" + "=" * 80 + "\n\n")
