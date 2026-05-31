@@ -40,7 +40,8 @@ def scan_medical_records(folder: str) -> dict:
 
 
 def build_index(num_workers: int = 1,
-                skip_existing: bool = False, limit: int = 0):
+                skip_existing: bool = False, limit: int = 0,
+                llm_workers: int = 5):
     """
     build 模式：从 MySQL medical_records 原始表分批解析病历，提取特征向量，即时存入 record_vectors 表。
     强制启用 LLM 病例卡抽取 + embedding。
@@ -136,7 +137,7 @@ def build_index(num_workers: int = 1,
                 # LLM 病例卡抽取（在每条记录入库后单独执行）
                 _extract_case_cards_batch(
                     batch, llm_extractor, emb_service, cc_store,
-                    skip_existing, system
+                    skip_existing, system, llm_workers=llm_workers
                 )
         finally:
             if executor is not None:
@@ -151,7 +152,7 @@ def build_index(num_workers: int = 1,
             # LLM 病例卡抽取
             _extract_case_cards_batch(
                 batch, llm_extractor, emb_service, cc_store,
-                skip_existing, system
+                skip_existing, system, llm_workers=llm_workers
             )
     system.save()
 
@@ -166,9 +167,11 @@ def build_index(num_workers: int = 1,
 
 
 def _extract_case_cards_batch(batch: dict, llm_extractor, emb_service,
-                              cc_store, skip_existing: bool, system) -> None:
+                              cc_store, skip_existing: bool, system,
+                              llm_workers: int = 5) -> None:
     """
     批量抽取病例卡 + embedding，写入 case_card_store。
+    使用线程池并行调用 LLM（IO 密集型）。
 
     Args:
         batch: {record_id: text} 映射
@@ -177,30 +180,48 @@ def _extract_case_cards_batch(batch: dict, llm_extractor, emb_service,
         cc_store: MySQLCaseCardStore 实例
         skip_existing: 是否跳过已有记录
         system: MedicalRecordSimilaritySystem 实例（更新内存缓存）
+        llm_workers: LLM 并行数（默认 5）
     """
     from case_card_store import DEFAULT_EXTRACTOR_VERSION
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    import time
 
     extractor_version = DEFAULT_EXTRACTOR_VERSION
     embedding_model = emb_service.config.model if emb_service else ""
-    success = 0
-    skip = 0
-    fail = 0
+    cache_lock = threading.Lock()
+    stats = {"success": 0, "skip": 0, "fail": 0}
+    # 速率限制：每个请求之间至少间隔 interval 秒，避免触发 API 限流
+    _next_request_time = 0.0
+    _rate_lock = threading.Lock()
+    _min_interval = 1.0  # 两次 LLM 请求最小间隔（秒），可根据 API 限制调整
 
-    for record_id, text in batch.items():
-        # 跳过已有同版本病例卡
+    def _wait_rate_limit() -> None:
+        """等待直到可以发送下一个请求"""
+        nonlocal _next_request_time
+        with _rate_lock:
+            now = time.time()
+            if now < _next_request_time:
+                time.sleep(_next_request_time - now)
+            _next_request_time = time.time() + _min_interval
+
+    total = len(batch)
+    if total == 0:
+        return
+
+    def _process_one(record_id: str, text: str) -> str:
+        """处理单条记录（在子线程中执行），返回状态: success/skip/fail"""
         if skip_existing and cc_store.exists(record_id, extractor_version):
-            skip += 1
-            continue
+            return "skip"
 
         try:
-            # LLM 抽取
+            _wait_rate_limit()  # 速率限制
+
             card = llm_extractor.extract(text, record_id=record_id)
             if card is None:
-                fail += 1
                 logger.warning(f"[{record_id}] 病例卡抽取失败")
-                continue
+                return "fail"
 
-            # Embedding
             embedding = None
             summary = card.get("summary_for_embedding", "")
             if summary and emb_service and emb_service.is_available:
@@ -209,34 +230,56 @@ def _extract_case_cards_batch(batch: dict, llm_extractor, emb_service,
                 except Exception as e:
                     logger.warning(f"[{record_id}] embedding 生成失败: {e}")
 
-            # 写入 MySQL
             cc_store.insert(record_id, card, embedding, extractor_version, embedding_model)
 
-            # 更新内存缓存（供后续搜索使用）
-            system._case_card_cache[record_id] = card
-            if embedding is not None and system._embedding_cache is not None:
-                # 简单追加（线程不安全但在单线程 build 中 OK）
-                system._embedding_ids.append(record_id)
-                system._embedding_id_to_idx[record_id] = len(system._embedding_ids) - 1
-                emb_norm = embedding.astype(np.float64)
-                norm = np.linalg.norm(emb_norm)
-                if norm > 0:
-                    emb_norm = emb_norm / norm
-                if system._embedding_cache.size == 0:
-                    system._embedding_cache = emb_norm.reshape(1, -1).astype(np.float32)
-                else:
-                    system._embedding_cache = np.vstack([
-                        system._embedding_cache, emb_norm.astype(np.float32).reshape(1, -1)
-                    ])
+            with cache_lock:
+                system._case_card_cache[record_id] = card
+                if embedding is not None and system._embedding_cache is not None:
+                    system._embedding_ids.append(record_id)
+                    system._embedding_id_to_idx[record_id] = len(system._embedding_ids) - 1
+                    emb_norm = embedding.astype(np.float64)
+                    norm = np.linalg.norm(emb_norm)
+                    if norm > 0:
+                        emb_norm = emb_norm / norm
+                    if system._embedding_cache.size == 0:
+                        system._embedding_cache = emb_norm.reshape(1, -1).astype(np.float32)
+                    else:
+                        system._embedding_cache = np.vstack([
+                            system._embedding_cache, emb_norm.astype(np.float32).reshape(1, -1)
+                        ])
 
-            success += 1
+            return "success"
 
         except Exception as e:
-            fail += 1
             logger.error(f"[{record_id}] 病例卡处理异常: {e}")
+            return "fail"
 
-    if success > 0 or fail > 0:
-        logger.info(f"  病例卡批次: 成功 {success}, 跳过 {skip}, 失败 {fail}")
+    with ThreadPoolExecutor(max_workers=llm_workers) as executor:
+        futures = {
+            executor.submit(_process_one, record_id, text): record_id
+            for record_id, text in batch.items()
+        }
+        for future in as_completed(futures):
+            try:
+                status = future.result()
+            except Exception:
+                status = "fail"
+            if status == "success":
+                stats["success"] += 1
+            elif status == "skip":
+                stats["skip"] += 1
+            else:
+                stats["fail"] += 1
+            done = stats["success"] + stats["skip"] + stats["fail"]
+            print(f"\r  LLM 病例卡: [{done}/{total}] "
+                  f"(成功 {stats['success']}, 跳过 {stats['skip']}, 失败 {stats['fail']})",
+                  end="", flush=True)
+
+    if stats["success"] > 0 or stats["fail"] > 0:
+        print()  # 换行，结束进度行
+        logger.info(f"  病例卡批次: 成功 {stats['success']}, 跳过 {stats['skip']}, 失败 {stats['fail']}")
+    elif stats["skip"] > 0:
+        print()  # 全部跳过时也换行
 
 
 def search():
@@ -418,6 +461,8 @@ def main():
                         help='跳过已有相同 extractor_version 的病例卡记录')
     parser.add_argument('--limit', type=int, default=0,
                         help='限制 build 处理条数（0=不限制，用于调试成本控制）')
+    parser.add_argument('--llm-workers', type=int, default=5,
+                        help='LLM 病例卡抽取并行线程数（默认 5，IO 密集型可适当增大）')
     args = parser.parse_args()
 
     num_workers = args.workers
@@ -436,6 +481,7 @@ def main():
             num_workers=num_workers,
             skip_existing=args.skip_existing_case_cards,
             limit=args.limit,
+            llm_workers=args.llm_workers,
         )
     else:
         search()
