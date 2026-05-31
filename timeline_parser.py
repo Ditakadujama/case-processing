@@ -517,6 +517,37 @@ class TimelineParser:
 
         return events
 
+    def get_admission_anchor(self, events: List[TimelineEvent]) -> Optional[datetime]:
+        """返回窗口截取起点：最早 admission，否则最早有效事件时间戳。"""
+        valid_events = [e for e in events if e.timestamp]
+        if not valid_events:
+            return None
+
+        admission_events = [e for e in valid_events if e.event_type == "admission"]
+        if admission_events:
+            return min(e.timestamp for e in admission_events)
+
+        return min(e.timestamp for e in valid_events)
+
+    def get_first_days_snapshot(
+        self,
+        events: List[TimelineEvent],
+        days: int,
+    ) -> List[TimelineEvent]:
+        """截取从入院起点开始的前 N 天事件。days <= 0 时返回完整事件副本。"""
+        if days <= 0:
+            return list(events)
+
+        anchor = self.get_admission_anchor(events)
+        if anchor is None:
+            return list(events)
+
+        cutoff = anchor + timedelta(days=days)
+        return [
+            e for e in events
+            if e.timestamp and anchor <= e.timestamp < cutoff
+        ]
+
     def _extract_key_lab_values(self, text: str) -> Dict[str, str]:
         """从检验详情中提取关键指标数值"""
         values = {}

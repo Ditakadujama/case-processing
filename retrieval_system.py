@@ -19,7 +19,11 @@ from timeline_parser import TimelineParser
 from timeline_similarity import TimelineSimilarityScorer, TimelineFeatures
 from vector_store import MySQLVectorStore
 from config import DBConfig, EmbeddingConfig
-from case_card import tag_overlap_score, find_common_and_diff_tags
+from case_card import (
+    tag_overlap_score, find_common_and_diff_tags,
+    disease_axis_similarity, has_disease_axis_conflict,
+    find_strong_common_tags, has_strong_common_tag,
+)
 from embedding_index import EmbeddingService, cosine_similarity, batch_cosine_similarity
 
 
@@ -181,6 +185,9 @@ class MedicalRecordSimilaritySystem:
 
         # TF-IDF 向量器是否已训练
         self._extractor_fitted = False
+
+        # 病程窗口特征缓存: {(record_id, days): TimelineFeatures}
+        self._timeline_window_feature_cache: Dict[Tuple[str, int], object] = {}
 
         # 尝试加载已有索引
         if self._get_store().count() > 0:
@@ -367,7 +374,9 @@ class MedicalRecordSimilaritySystem:
                top_k: int = 10,
                auto_add: bool = False,
                record_id: Optional[str] = None,
-               exclude_record_ids: Optional[set] = None) -> List[Dict]:
+               exclude_record_ids: Optional[set] = None,
+               timeline_days: int = 0,
+               timeline_window_weight: float = 0.55) -> List[Dict]:
         """
         检索相似病例
 
@@ -377,18 +386,29 @@ class MedicalRecordSimilaritySystem:
             auto_add: 是否自动入库
             record_id: 病例ID（auto_add=True时必填）
             exclude_record_ids: 需要排除的病例ID集合（如查询病例自身）
+            timeline_days: 病程窗口天数；0=完整住院病程；N>0=额外比较入院后前N天
+            timeline_window_weight: 窗口病程分在混合病程分中的权重（0~1，默认0.55）
 
         Returns:
             [{'id': xxx, 'similarity': 0.85, 'text': xxx}, ...]
         """
-        if auto_add:
-            return self.search_and_add(query_text, record_id, top_k, exclude_record_ids)
+        if timeline_days < 0:
+            raise ValueError("timeline_days 不能小于 0")
+        if not 0.0 <= timeline_window_weight <= 1.0:
+            raise ValueError("timeline_window_weight 必须在 0~1 之间")
 
-        results, _, _, _ = self._search_only(query_text, top_k, exclude_record_ids)
+        if auto_add:
+            return self.search_and_add(query_text, record_id, top_k, exclude_record_ids,
+                                       timeline_days, timeline_window_weight)
+
+        results, _, _, _ = self._search_only(query_text, top_k, exclude_record_ids,
+                                              timeline_days, timeline_window_weight)
         return results
 
     def _search_only(self, query_text: str, top_k: int,
-                     exclude_record_ids: Optional[set] = None) -> Tuple[List[Dict], MedicalRecord, np.ndarray, object]:
+                     exclude_record_ids: Optional[set] = None,
+                     timeline_days: int = 0,
+                     timeline_window_weight: float = 0.55) -> Tuple[List[Dict], MedicalRecord, np.ndarray, object]:
         """仅检索，不入库。返回 (results, parsed_record, features, timeline_features) 供 search_and_add 复用"""
         if not self.record_order:
             return [], None, None, None
@@ -400,14 +420,29 @@ class MedicalRecordSimilaritySystem:
         query_features = self.extractor.extract(query_record).reshape(1, -1)
         query_summary_vec = _char_ngram_vector(_extract_summary_text(query_text))
 
-        # 解析查询病历的时间轴（传入手术类型）
+        # 解析查询病历的时间轴
         query_events = self.timeline_parser.parse(query_text)
         query_nodes = self.timeline_parser.generate_standard_nodes(query_events)
-        query_timeline_features = self.timeline_scorer.extract_features(
+        query_full_timeline_features = self.timeline_scorer.extract_features(
             query_events, query_nodes,
             surgery_type_hint=query_record.surgery_type or None,
             surgery_keywords_hint=query_record.surgery_keywords or None
         )
+
+        # 窗口病程特征（仅在指定天数时计算）
+        query_window_timeline_features = None
+        if timeline_days > 0:
+            query_window_events = self.timeline_parser.get_first_days_snapshot(
+                query_events, timeline_days
+            )
+            query_window_nodes = self.timeline_parser.generate_standard_nodes(
+                query_window_events
+            )
+            query_window_timeline_features = self.timeline_scorer.extract_features(
+                query_window_events, query_window_nodes,
+                surgery_type_hint=query_record.surgery_type or None,
+                surgery_keywords_hint=query_record.surgery_keywords or None
+            )
 
         # ── LLM 增强：查询病历实时抽取病例卡 + embedding ──
         query_card = None
@@ -479,13 +514,44 @@ class MedicalRecordSimilaritySystem:
 
             cand_data = self._metadata_cache.get(record_id, {})
             text = cand_data.get('text', '')
-            cand_timeline_features = self._timeline_features_for_candidate(
+            cand_full_features = self._timeline_features_for_candidate(
                 record_id, text, cand_data.get('timeline_features')
             )
-            if cand_timeline_features is not None:
-                timeline_sim = self.timeline_scorer.score(query_timeline_features, cand_timeline_features)
+
+            # 完整病程相似度
+            if cand_full_features is not None:
+                full_timeline_sim = self.timeline_scorer.score(
+                    query_full_timeline_features, cand_full_features
+                )
             else:
-                timeline_sim = vector_sim
+                full_timeline_sim = vector_sim
+
+            # 窗口病程相似度
+            window_timeline_sim_val = None
+            timeline_sim = full_timeline_sim
+            timeline_window_fallback = False
+            MIN_WINDOW_EVENTS = 2
+
+            if timeline_days > 0 and query_window_timeline_features is not None:
+                cand_window_features = self._timeline_window_features_for_candidate(
+                    record_id, text, timeline_days
+                )
+                if cand_window_features is not None:
+                    # 检查窗口事件数量是否足够（用独立 event_count 而非压缩后的 event_type_sequence）
+                    q_count = query_window_timeline_features.event_count
+                    c_count = cand_window_features.event_count
+                    if q_count >= MIN_WINDOW_EVENTS and c_count >= MIN_WINDOW_EVENTS:
+                        window_timeline_sim_val = self.timeline_scorer.score(
+                            query_window_timeline_features, cand_window_features
+                        )
+                        timeline_sim = (
+                            timeline_window_weight * window_timeline_sim_val
+                            + (1.0 - timeline_window_weight) * full_timeline_sim
+                        )
+                    else:
+                        timeline_window_fallback = True
+                        window_timeline_sim_val = None
+                        timeline_sim = full_timeline_sim
 
             text_sim = self._text_similarity(record_id, text, query_summary_vec)
 
@@ -521,39 +587,65 @@ class MedicalRecordSimilaritySystem:
             use_tag = has_case_cards and query_card is not None
 
             if use_embedding and use_tag:
-                # 完整四路融合
-                final_sim = (
+                # 完整四路融合 (v1.1: timeline 0.40→0.30, tag 0.10→0.20)
+                base_sim = (
                     0.15 * vector_sim +
-                    0.40 * timeline_sim +
+                    0.30 * timeline_sim +
                     0.35 * embedding_sim +
-                    0.10 * tag_overlap_sim
+                    0.20 * tag_overlap_sim
                 )
             elif use_embedding:
                 # 有 embedding 但无标签
-                final_sim = (
-                    0.18 * vector_sim +
-                    0.42 * timeline_sim +
-                    0.40 * embedding_sim
+                base_sim = (
+                    0.20 * vector_sim +
+                    0.35 * timeline_sim +
+                    0.45 * embedding_sim
                 )
             elif use_tag:
                 # 有病例卡标签但无 embedding
-                final_sim = (
+                base_sim = (
                     0.20 * vector_sim +
-                    0.45 * timeline_sim +
+                    0.35 * timeline_sim +
                     0.20 * text_sim +
-                    0.15 * tag_overlap_sim
+                    0.25 * tag_overlap_sim
                 )
             else:
-                # 原始三路融合
-                final_sim = (
+                # 原始三路融合（保持现有逻辑，避免影响非 LLM 模式）
+                base_sim = (
                     0.30 * vector_sim +
                     0.45 * timeline_sim +
                     0.25 * text_sim
                 )
 
             if timeline_sim < self.min_timeline_score:
-                final_sim *= 0.5
-            final_sim = min(1.0, max(0.0, final_sim))
+                base_sim *= 0.5
+
+            # ── v1.1 排序修正：disease_axis 软门控 ──
+            ranking_bonus = 0.0
+            ranking_penalty = 0.0
+            axis_conflict = False
+            axis_sim = 0.5  # 默认中性
+
+            if use_tag and query_card:
+                cand_card = self._case_card_cache.get(record_id)
+                if cand_card:
+                    axis_sim = disease_axis_similarity(query_card, cand_card)
+                    axis_conflict = has_disease_axis_conflict(query_card, cand_card)
+
+                    if axis_conflict:
+                        ranking_penalty += 0.08
+
+                    if axis_sim == 1.0:
+                        ranking_bonus += 0.03
+
+                    if tag_overlap_sim == 0.0 and not has_strong_common_tag(query_card, cand_card):
+                        ranking_penalty += 0.04
+
+                    # P0: 仅有泛化共同标签，无诊断/特异干预交集
+                    if tag_overlap_sim > 0 and not has_strong_common_tag(query_card, cand_card):
+                        ranking_penalty += 0.02
+
+            final_sim = max(0.0, min(1.0, base_sim + ranking_bonus - ranking_penalty))
 
             if final_sim >= self.threshold:
                 result = {
@@ -564,37 +656,59 @@ class MedicalRecordSimilaritySystem:
                     'text_similarity': round(text_sim, 4),
                     'text': text[:200] + "..." if len(text) > 200 else text,
                     'full_text': text,
+                    # 窗口病程字段
+                    'full_timeline_similarity': round(full_timeline_sim, 4),
+                    'window_timeline_similarity': round(window_timeline_sim_val, 4) if window_timeline_sim_val is not None else '-',
+                    'timeline_window_days': timeline_days,
+                    'timeline_window_weight': timeline_window_weight if timeline_days > 0 else 0.0,
                 }
+                if timeline_window_fallback:
+                    result['timeline_window_fallback'] = True
 
                 # LLM 增强时附加额外字段
                 if use_tag or use_embedding:
                     result['embedding_similarity'] = round(embedding_sim, 4)
                     result['tag_overlap_similarity'] = round(tag_overlap_sim, 4)
+                    # v1.1 排序解释字段
+                    result['base_similarity'] = round(base_sim, 4)
+                    result['ranking_bonus'] = round(ranking_bonus, 4)
+                    result['ranking_penalty'] = round(ranking_penalty, 4)
+                    result['disease_axis_similarity'] = round(axis_sim, 4)
+                    result['disease_axis_conflict'] = axis_conflict
                     # 相似原因
                     if query_card:
                         cand_card = self._case_card_cache.get(record_id)
                         if cand_card:
                             result['similarity_reasons'] = find_common_and_diff_tags(query_card, cand_card)
+                            result['strong_common_tags'] = find_strong_common_tags(query_card, cand_card)
                 else:
                     result['embedding_similarity'] = '-'
                     result['tag_overlap_similarity'] = '-'
+                    result['base_similarity'] = round(base_sim, 4)
+                    result['ranking_bonus'] = 0.0
+                    result['ranking_penalty'] = 0.0
+                    result['disease_axis_similarity'] = '-'
+                    result['disease_axis_conflict'] = False
 
                 candidates.append(result)
 
         candidates.sort(key=lambda x: x['similarity'], reverse=True)
-        return candidates[:top_k], query_record, query_features, query_timeline_features
+        return candidates[:top_k], query_record, query_features, query_full_timeline_features
 
     def search_and_add(self,
                        query_text: str,
                        record_id: Optional[str] = None,
                        top_k: int = 10,
-                       exclude_record_ids: Optional[set] = None) -> List[Dict]:
+                       exclude_record_ids: Optional[set] = None,
+                       timeline_days: int = 0,
+                       timeline_window_weight: float = 0.55) -> List[Dict]:
         """
         检索相似病例 + 自动入库（复用 _search_only 的解析结果，避免重复 parse）
         """
         # 1. 检索（保留中间解析结果）
         results, query_record, query_features, query_timeline_features = \
-            self._search_only(query_text, top_k, exclude_record_ids)
+            self._search_only(query_text, top_k, exclude_record_ids,
+                            timeline_days, timeline_window_weight)
 
         # 2. 自动入库（复用解析结果，避免重复 parse/extract/timeline）
         if record_id is None:
@@ -659,6 +773,33 @@ class MedicalRecordSimilaritySystem:
         self._metadata_cache.setdefault(record_id, {})['timeline_features'] = refreshed
         self._timeline_refreshed_ids.add(record_id)
         return refreshed
+
+    def _timeline_window_features_for_candidate(
+        self,
+        record_id: str,
+        text: str,
+        timeline_days: int,
+    ):
+        """按窗口动态计算候选病例的时间轴特征（带缓存）"""
+        if timeline_days <= 0 or not text:
+            return None
+
+        cache_key = (record_id, timeline_days)
+        cached = self._timeline_window_feature_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        events = self.timeline_parser.parse(text)
+        window_events = self.timeline_parser.get_first_days_snapshot(events, timeline_days)
+        nodes = self.timeline_parser.generate_standard_nodes(window_events)
+        parsed = self.parser.parse(text)
+        features = self.timeline_scorer.extract_features(
+            window_events, nodes,
+            surgery_type_hint=parsed.surgery_type or None,
+            surgery_keywords_hint=parsed.surgery_keywords or None,
+        )
+        self._timeline_window_feature_cache[cache_key] = features
+        return features
 
     def _save_index(self) -> None:
         """保存轻量配置文件（向量数据已通过 MySQL 持久化）"""

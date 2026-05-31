@@ -282,7 +282,7 @@ def _extract_case_cards_batch(batch: dict, llm_extractor, emb_service,
         print()  # 全部跳过时也换行
 
 
-def search():
+def search(timeline_days: int = 0, timeline_window_weight: float = 0.55):
     """
     search 模式：从 MySQL record_vectors 表加载预计算向量，检索相似病例。
 
@@ -292,12 +292,23 @@ def search():
     - 结果输出到 data/results/ 每个查询一个文件
 
     自动检测病例卡数据，如果可用则启用 LLM 增强四路融合。
+
+    Args:
+        timeline_days: 病程窗口天数；0=完整住院病程
+        timeline_window_weight: 窗口病程分权重（0~1）
     """
     from case_card_store import MySQLCaseCardStore
 
     print("=" * 60)
     print("相似病例检索")
     print("=" * 60)
+
+    # 打印病程比较模式
+    if timeline_days > 0:
+        print(f"病程比较模式: 完整住院病程 + 入院后前 {timeline_days} 天窗口")
+        print(f"窗口病程权重: {timeline_window_weight}")
+    else:
+        print("病程比较模式: 完整住院病程")
 
     cfg = DBConfig.from_env()
 
@@ -347,16 +358,56 @@ def search():
                 print(f"    {key}: [{ts}] {event.description[:50]}")
 
         query_id = os.path.splitext(filename)[0]
-        results = system.search(query_text, top_k=5, exclude_record_ids={filename, query_id})
+        results = system.search(query_text, top_k=5, exclude_record_ids={filename, query_id},
+                                timeline_days=timeline_days,
+                                timeline_window_weight=timeline_window_weight)
         print(f"\n  检索结果（Top {len(results)}）:")
 
         for i, r in enumerate(results, 1):
             vec_sim = r.get('vector_similarity', r['similarity'])
             tl_sim = r.get('timeline_similarity', '-')
+            full_tl = r.get('full_timeline_similarity', '-')
+            win_tl = r.get('window_timeline_similarity', '-')
             emb_sim = r.get('embedding_similarity', '-')
             tag_sim = r.get('tag_overlap_similarity', '-')
+            base_sim = r.get('base_similarity', '-')
+            bonus = r.get('ranking_bonus', 0)
+            penalty = r.get('ranking_penalty', 0)
+            axis_conflict = r.get('disease_axis_conflict', False)
+
+            # 排序置信度等级
+            if i == 1 and len(results) >= 2:
+                top1 = r['similarity']
+                top2 = results[1]['similarity']
+                gap = top1 - top2
+                if gap < 0.005:
+                    confidence = "low"
+                elif gap < 0.015:
+                    confidence = "medium"
+                else:
+                    confidence = "high"
+            else:
+                confidence = "-"
+
+            # 病程分展示
+            if timeline_days > 0 and win_tl != '-':
+                tl_display = f"病程: {tl_sim} (完整: {full_tl}, 前{timeline_days}天: {win_tl})"
+            else:
+                tl_display = f"病程: {tl_sim}"
+
+            # 排序修正展示
+            correction_parts = []
+            if bonus > 0:
+                correction_parts.append(f"+{bonus}")
+            if penalty > 0:
+                correction_parts.append(f"-{penalty}")
+            correction_str = f" 修正: {', '.join(correction_parts)}" if correction_parts else ""
+
+            conflict_str = " ⚠主题冲突" if axis_conflict else ""
+            conf_str = f" 置信度: {confidence}" if confidence != "-" else ""
+
             print(f"\n  [{i}] {r['id']} (综合: {r['similarity']}, "
-                  f"向量: {vec_sim}, 病程: {tl_sim}, 摘要: {emb_sim}, 标签: {tag_sim})")
+                  f"基础: {base_sim}, 向量: {vec_sim}, {tl_display}, 语义: {emb_sim}, 标签: {tag_sim}){correction_str}{conflict_str}{conf_str}")
 
             matched_text = r.get('full_text', '')
             if matched_text:
@@ -385,6 +436,10 @@ def search():
                     common_items.append(f"共同器官问题: {', '.join(reasons['common_organ_failures'][:3])}")
                 if common_items:
                     print(f"      相似原因: {'; '.join(common_items)}")
+            # 显示强共同标签
+            strong_tags = r.get('strong_common_tags')
+            if strong_tags:
+                print(f"      强共同标签: {', '.join(strong_tags[:5])}")
 
             all_results.append({
                 'query_file': filename,
@@ -392,9 +447,20 @@ def search():
                 'similarity': r['similarity'],
                 'vector_similarity': r.get('vector_similarity', r['similarity']),
                 'timeline_similarity': r.get('timeline_similarity', '-'),
+                'full_timeline_similarity': r.get('full_timeline_similarity', '-'),
+                'window_timeline_similarity': r.get('window_timeline_similarity', '-'),
+                'timeline_window_days': r.get('timeline_window_days', 0),
+                'timeline_window_weight': r.get('timeline_window_weight', 0.0),
+                'timeline_window_fallback': r.get('timeline_window_fallback', False),
                 'text_similarity': r.get('text_similarity', '-'),
                 'embedding_similarity': r.get('embedding_similarity', '-'),
                 'tag_overlap_similarity': r.get('tag_overlap_similarity', '-'),
+                'base_similarity': r.get('base_similarity', '-'),
+                'ranking_bonus': r.get('ranking_bonus', 0),
+                'ranking_penalty': r.get('ranking_penalty', 0),
+                'disease_axis_similarity': r.get('disease_axis_similarity', '-'),
+                'disease_axis_conflict': r.get('disease_axis_conflict', False),
+                'strong_common_tags': r.get('strong_common_tags', []),
                 'similarity_reasons': r.get('similarity_reasons'),
                 'full_text': r['full_text']
             })
@@ -407,19 +473,67 @@ def search():
         safe_name = filename.replace('.txt', '')
         output_file = os.path.join(result_dir, f"{safe_name}_结果.txt")
         file_results = [r for r in all_results if r['query_file'] == filename]
+
+        # 计算排序置信度（基于 Top-1/Top-2 gap）
+        confidence = "-"
+        if len(file_results) >= 2:
+            gap = file_results[0]['similarity'] - file_results[1]['similarity']
+            if gap < 0.005:
+                confidence = "low"
+            elif gap < 0.015:
+                confidence = "medium"
+            else:
+                confidence = "high"
+
         with open(output_file, 'w', encoding='utf-8') as f:
+            # 写入查询级别摘要
+            f.write(f"查询文件: {filename}\n")
+            if confidence != "-":
+                f.write(f"排序置信度: {confidence}")
+                if confidence == "low":
+                    f.write(" (Top-1/Top-2 分差过小，建议人工复核)")
+                f.write("\n")
+            f.write("=" * 60 + "\n\n")
+
             for result in file_results:
                 f.write(f"匹配病例: {result['matched_id']}\n")
                 f.write(f"综合相似度: {result['similarity']}\n")
+                f.write(f"基础融合分: {result.get('base_similarity', '-')}\n")
                 f.write(f"向量相似度: {result.get('vector_similarity', '-')}\n")
                 f.write(f"病程相似度: {result.get('timeline_similarity', '-')}\n")
+                f.write(f"完整病程相似度: {result.get('full_timeline_similarity', '-')}\n")
+                f.write(f"指定窗口病程相似度: {result.get('window_timeline_similarity', '-')}\n")
+                f.write(f"指定病程窗口天数: {result.get('timeline_window_days', 0)}\n")
+                if result.get('timeline_window_days', 0) > 0:
+                    f.write(f"指定窗口权重: {result.get('timeline_window_weight', 0.0)}\n")
+                    fallback = result.get('timeline_window_fallback', False)
+                    f.write(f"窗口病程回退: {'是（窗口事件不足导致回退到完整病程）' if fallback else '否'}\n")
                 f.write(f"病例卡语义相似度: {result.get('embedding_similarity', '-')}\n")
                 f.write(f"标签重叠相似度: {result.get('tag_overlap_similarity', '-')}\n")
+
+                # v1.1 排序解释字段
+                f.write(f"\n--- 排序解释 ---\n")
+                axis_sim = result.get('disease_axis_similarity', '-')
+                axis_conflict = result.get('disease_axis_conflict', False)
+                f.write(f"临床主题相似度: {axis_sim}\n")
+                f.write(f"临床主题冲突: {'是（不同主题领域）' if axis_conflict else '否'}\n")
+
+                strong_tags = result.get('strong_common_tags', [])
+                if strong_tags:
+                    f.write(f"强共同标签: {', '.join(strong_tags)}\n")
+                else:
+                    f.write(f"强共同标签: (无)\n")
+
+                bonus = result.get('ranking_bonus', 0)
+                penalty = result.get('ranking_penalty', 0)
+                f.write(f"排序奖励: +{bonus}\n")
+                f.write(f"排序惩罚: -{penalty}\n")
+                f.write(f"\n")
 
                 # 相似原因
                 reasons = result.get('similarity_reasons')
                 if reasons:
-                    f.write(f"\n相似原因:\n")
+                    f.write(f"相似原因:\n")
                     if reasons.get('common_diagnoses'):
                         f.write(f"  - 共同诊断: {', '.join(reasons['common_diagnoses'])}\n")
                     if reasons.get('common_interventions'):
@@ -463,6 +577,10 @@ def main():
                         help='限制 build 处理条数（0=不限制，用于调试成本控制）')
     parser.add_argument('--llm-workers', type=int, default=5,
                         help='LLM 病例卡抽取并行线程数（默认 5，IO 密集型可适当增大）')
+    parser.add_argument('--timeline-days', type=int, default=0,
+                        help='病程窗口天数：0=完整住院病程；N>0=额外比较入院后前N天并与完整病程分融合')
+    parser.add_argument('--timeline-window-weight', type=float, default=0.55,
+                        help='窗口病程分在混合病程分中的权重（0~1，默认 0.55）')
     args = parser.parse_args()
 
     num_workers = args.workers
@@ -484,7 +602,13 @@ def main():
             llm_workers=args.llm_workers,
         )
     else:
-        search()
+        # 参数校验
+        if args.timeline_days < 0:
+            parser.error("--timeline-days 不能小于 0")
+        if not 0.0 <= args.timeline_window_weight <= 1.0:
+            parser.error("--timeline-window-weight 必须在 0~1 之间")
+        search(timeline_days=args.timeline_days,
+               timeline_window_weight=args.timeline_window_weight)
 
 
 if __name__ == "__main__":

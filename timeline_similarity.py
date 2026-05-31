@@ -68,11 +68,12 @@ SURGERY_TYPE_KEYWORDS: Dict[str, Tuple[str, ...]] = {
 @dataclass
 class TimelineFeatures:
     """预计算的时间轴特征，用于快速相似度计算（基于就诊计数模型）"""
-    visit_count: int                    # 就诊天数
+    visit_count: int                    # 就诊天数（唯一日期数）
+    event_count: int                    # 真实事件数（含连续同类，不经压缩）
     total_span_days: float              # 首末次就诊间隔天数
     visit_gaps: List[float]             # 相邻就诊间隔天数序列
     diagnosis_keywords: Set[str]        # 所有诊断相关事件中提取的诊断关键词
-    event_type_sequence: List[str]      # 按时间排序的事件类型序列
+    event_type_sequence: List[str]      # 按时间排序的事件类型序列（连续同类去重）
     surgery_type: Optional[str] = None  # 手术专科类型（由 record_parser 提供）
     surgery_keywords: Set[str] = field(default_factory=set)  # 手术名称关键词
     intervention_keywords: Set[str] = field(default_factory=set)  # 关键治疗/支持手段
@@ -216,6 +217,7 @@ class TimelineSimilarityScorer:
 
         return TimelineFeatures(
             visit_count=visit_count,
+            event_count=len(events),
             total_span_days=total_span_days,
             visit_gaps=visit_gaps,
             diagnosis_keywords=diag_keywords,

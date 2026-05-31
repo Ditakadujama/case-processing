@@ -34,6 +34,7 @@ def _serialize_timeline_features(tf) -> dict:
         return None
     return {
         'visit_count': tf.visit_count,
+        'event_count': getattr(tf, 'event_count', tf.visit_count),
         'total_span_days': tf.total_span_days,
         'visit_gaps': tf.visit_gaps,
         'diagnosis_keywords': list(tf.diagnosis_keywords) if tf.diagnosis_keywords else [],
@@ -53,6 +54,7 @@ def _deserialize_timeline_features(data: dict):
         return None
     return TimelineFeatures(
         visit_count=data.get('visit_count', 1),
+        event_count=data.get('event_count', data.get('visit_count', 1)),
         total_span_days=data.get('total_span_days', 0.0),
         visit_gaps=data.get('visit_gaps', []),
         diagnosis_keywords=set(data.get('diagnosis_keywords', [])),

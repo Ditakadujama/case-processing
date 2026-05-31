@@ -1,7 +1,10 @@
 """
 检索评测脚本
 随机选取 100 个病例作为查询，逐一检索，统计评测指标
+
+支持 --timeline-days N 进行指定窗口病程评测，统计完整/窗口病程分及回退率。
 """
+import argparse
 import random
 import sys
 import os
@@ -17,6 +20,21 @@ from timeline_similarity import SURGERY_TYPE_RULES
 
 
 def main():
+    parser = argparse.ArgumentParser(description='病历检索评测脚本')
+    parser.add_argument('--timeline-days', type=int, default=0,
+                        help='病程窗口天数：0=完整住院病程；N>0=额外比较入院后前N天并与完整病程分融合')
+    parser.add_argument('--timeline-window-weight', type=float, default=0.55,
+                        help='窗口病程分在混合病程分中的权重（0~1，默认 0.55）')
+    args = parser.parse_args()
+
+    if args.timeline_days < 0:
+        parser.error("--timeline-days 不能小于 0")
+    if not 0.0 <= args.timeline_window_weight <= 1.0:
+        parser.error("--timeline-window-weight 必须在 0~1 之间")
+
+    timeline_days = args.timeline_days
+    timeline_window_weight = args.timeline_window_weight
+
     cfg = DBConfig.from_env()
     store = MySQLVectorStore(cfg)
     total = store.count()
@@ -28,6 +46,9 @@ def main():
     metadata = store.load_all_metadata()
     all_ids = list(metadata.keys())
     print(f"底库总数: {total}")
+
+    if timeline_days > 0:
+        print(f"病程窗口模式: 前 {timeline_days} 天 (权重 {timeline_window_weight})")
 
     # 自动检测 LLM 病例卡数据
     from case_card_store import MySQLCaseCardStore
@@ -89,6 +110,19 @@ def main():
     organ_jaccards = []
     compl_jaccards = []
 
+    # v1.1 新增指标
+    base_scores = []
+    ranking_bonuses = []
+    ranking_penalties = []
+    axis_conflict_count = 0
+    axis_match_count = 0
+    strong_tag_zero_count = 0  # tag_overlap=0 且无强共同标签的候选数
+
+    # 窗口病程统计（仅在 --timeline-days > 0 时有效）
+    window_tl_scores = []
+    full_tl_scores = []
+    window_fallback_count = 0
+
     for idx, qid in enumerate(query_ids):
         qmeta = metadata.get(qid, {})
         qtext = qmeta.get('text', '')
@@ -98,7 +132,9 @@ def main():
         q_surgery = get_surgery_specialty(qid)
 
         # 检索（排除自身）
-        results = system.search(qtext, top_k=5, exclude_record_ids={qid})
+        results = system.search(qtext, top_k=5, exclude_record_ids={qid},
+                                timeline_days=timeline_days,
+                                timeline_window_weight=timeline_window_weight)
 
         # 获取查询病例的病例卡（用于 Jaccard 计算）
         q_card = case_cards.get(qid)
@@ -110,6 +146,17 @@ def main():
             text_scores.append(r.get('text_similarity', 0))
             final_scores.append(r['similarity'])
 
+            # 窗口病程统计
+            if timeline_days > 0:
+                if r.get('timeline_window_fallback'):
+                    window_fallback_count += 1
+                w_tl = r.get('window_timeline_similarity')
+                f_tl = r.get('full_timeline_similarity')
+                if isinstance(w_tl, (int, float)):
+                    window_tl_scores.append(w_tl)
+                if isinstance(f_tl, (int, float)):
+                    full_tl_scores.append(f_tl)
+
             if enable_llm:
                 emb_sim = r.get('embedding_similarity', '-')
                 tag_sim = r.get('tag_overlap_similarity', '-')
@@ -117,6 +164,27 @@ def main():
                     emb_scores.append(emb_sim)
                 if isinstance(tag_sim, (int, float)):
                     tag_scores.append(tag_sim)
+
+                # v1.1 指标
+                base_sim = r.get('base_similarity', '-')
+                if isinstance(base_sim, (int, float)):
+                    base_scores.append(base_sim)
+                bonus = r.get('ranking_bonus', 0)
+                penalty = r.get('ranking_penalty', 0)
+                if isinstance(bonus, (int, float)):
+                    ranking_bonuses.append(bonus)
+                if isinstance(penalty, (int, float)):
+                    ranking_penalties.append(penalty)
+                if r.get('disease_axis_conflict'):
+                    axis_conflict_count += 1
+                axis_sim_val = r.get('disease_axis_similarity', 0)
+                if isinstance(axis_sim_val, (int, float)) and axis_sim_val >= 1.0:
+                    axis_match_count += 1
+                # tag_overlap=0 且无强共同标签
+                if isinstance(tag_sim, (int, float)) and tag_sim == 0.0:
+                    strong = r.get('strong_common_tags', [])
+                    if not strong:
+                        strong_tag_zero_count += 1
 
                 # Jaccard 指标（查询 vs 候选）
                 if q_card:
@@ -148,9 +216,16 @@ def main():
                 {'id': r['id'], 'final': r['similarity'],
                  'vec': r.get('vector_similarity', r['similarity']),
                  'tl': r.get('timeline_similarity', 0),
+                 'full_tl': r.get('full_timeline_similarity', '-'),
+                 'window_tl': r.get('window_timeline_similarity', '-'),
+                 'tl_fallback': r.get('timeline_window_fallback', False),
                  'text': r.get('text_similarity', 0),
                  'emb': r.get('embedding_similarity', '-'),
                  'tag': r.get('tag_overlap_similarity', '-'),
+                 'base': r.get('base_similarity', '-'),
+                 'bonus': r.get('ranking_bonus', 0),
+                 'penalty': r.get('ranking_penalty', 0),
+                 'axis_conflict': r.get('disease_axis_conflict', False),
                  'surgery': get_surgery_specialty(r['id'])}
                 for r in results
             ]
@@ -177,6 +252,8 @@ def main():
         score_groups.append(("病例卡语义相似度", emb_scores))
     if tag_scores:
         score_groups.append(("标签重叠相似度", tag_scores))
+    if base_scores:
+        score_groups.append(("基础融合分 (未修正)", base_scores))
 
     for name, scores in score_groups:
         arr = np.array(scores)
@@ -278,7 +355,63 @@ def main():
     if enable_llm:
         print(f"  语义主导 Top-1:       {emb_led}/{len(all_results)} ({emb_led*100/len(all_results):.1f}%)")
 
-    # 7. 分数阈值分析
+    # 7.5 v1.1 排序修正统计
+    if enable_llm and base_scores:
+        print(f"\n【v1.1 排序修正统计】")
+        base_arr = np.array(base_scores)
+        bonus_arr = np.array(ranking_bonuses) if ranking_bonuses else np.array([0])
+        penalty_arr = np.array(ranking_penalties) if ranking_penalties else np.array([0])
+        print(f"  基础融合分: 均值={base_arr.mean():.4f}, 中位数={np.median(base_arr):.4f}")
+        print(f"  排序奖励: 均值={bonus_arr.mean():.4f}, >0 次数={int((bonus_arr > 0).sum())}")
+        print(f"  排序惩罚: 均值={penalty_arr.mean():.4f}, >0 次数={int((penalty_arr > 0).sum())}")
+        total_llm_results = len(final_scores)
+        if total_llm_results > 0:
+            print(f"  主题冲突候选: {axis_conflict_count}/{total_llm_results} ({axis_conflict_count*100/total_llm_results:.1f}%)")
+            print(f"  主题匹配候选: {axis_match_count}/{total_llm_results} ({axis_match_count*100/total_llm_results:.1f}%)")
+            print(f"  tag_overlap=0 且无强共同标签: {strong_tag_zero_count}/{total_llm_results} ({strong_tag_zero_count*100/total_llm_results:.1f}%)")
+
+    # 7.6 排序置信度分布
+    if enable_llm:
+        print(f"\n【排序置信度分布】")
+        low_conf = 0
+        med_conf = 0
+        high_conf = 0
+        for r in all_results:
+            top5 = r['top5']
+            if len(top5) >= 2:
+                gap = top5[0]['final'] - top5[1]['final']
+                if gap < 0.005:
+                    low_conf += 1
+                elif gap < 0.015:
+                    med_conf += 1
+                else:
+                    high_conf += 1
+        total_queries = len(all_results)
+        print(f"  low (gap<0.005):    {low_conf}/{total_queries} ({low_conf*100/total_queries:.1f}%)")
+        print(f"  medium (0.005-0.015): {med_conf}/{total_queries} ({med_conf*100/total_queries:.1f}%)")
+        print(f"  high (gap>=0.015):  {high_conf}/{total_queries} ({high_conf*100/total_queries:.1f}%)")
+
+    # 7. 窗口病程统计（仅在 --timeline-days > 0 时输出）
+    if timeline_days > 0:
+        print(f"\n【窗口病程统计（前 {timeline_days} 天，权重 {timeline_window_weight}）】")
+        total_window_results = len(window_tl_scores) + len(full_tl_scores)
+        if total_window_results > 0:
+            if window_tl_scores:
+                w_arr = np.array(window_tl_scores)
+                print(f"  窗口病程分: 均值={w_arr.mean():.4f}, 中位数={np.median(w_arr):.4f}, "
+                      f"std={w_arr.std():.4f}, min={w_arr.min():.4f}, max={w_arr.max():.4f}")
+            if full_tl_scores:
+                f_arr = np.array(full_tl_scores)
+                print(f"  完整病程分: 均值={f_arr.mean():.4f}, 中位数={np.median(f_arr):.4f}, "
+                      f"std={f_arr.std():.4f}, min={f_arr.min():.4f}, max={f_arr.max():.4f}")
+            # 回退率 = 回退结果数 / 总结果数
+            total_candidate_results = len(final_scores)
+            if total_candidate_results > 0:
+                fallback_rate = window_fallback_count * 100 / total_candidate_results
+                print(f"  窗口回退: {window_fallback_count}/{total_candidate_results} "
+                      f"({fallback_rate:.1f}%) — 窗口事件不足 {2} 个时回退到完整病程")
+
+    # 8. 分数阈值分析
     print(f"\n【Top-1 分数阈值分布】")
     above_07 = sum(1 for s in top1_finals if s >= 0.7)
     above_06 = sum(1 for s in top1_finals if s >= 0.6)
@@ -287,7 +420,7 @@ def main():
     print(f"  ≥0.6: {above_06}/{len(top1_finals)} ({above_06*100/len(top1_finals):.1f}%)")
     print(f"  ≥0.5: {above_05}/{len(top1_finals)} ({above_05*100/len(top1_finals):.1f}%)")
 
-    # 8. LLM 标签 Jaccard 指标
+    # 9. LLM 标签 Jaccard 指标
     if diag_jaccards:
         print(f"\n【标签 Jaccard 指标】（查询 vs Top-5 候选）")
         for name, jaccs in [("诊断", diag_jaccards), ("关键干预", interv_jaccards),
@@ -305,12 +438,28 @@ def main():
         q_s = r['query_surgery'] or '-'
         print(f"\n查询: {qid} (手术: {q_s})")
         for i, t in enumerate(r['top5'][:3]):
+            tl_info = f"病程={t['tl']:.4f}"
+            if timeline_days > 0:
+                w_tl = t.get('window_tl', '-')
+                f_tl = t.get('full_tl', '-')
+                fb = " [回退]" if t.get('tl_fallback') else ""
+                tl_info = f"病程={t['tl']:.4f} (完整={f_tl}, 窗口={w_tl}){fb}"
             if enable_llm and isinstance(t.get('emb'), (int, float)):
-                print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} 向量={t['vec']:.4f} "
-                      f"病程={t['tl']:.4f} 语义={t['emb']:.4f} 标签={t['tag']:.4f} 手术={t['surgery'] or '-'}")
+                base_str = f"基础={t.get('base', '-')}" if isinstance(t.get('base'), (int, float)) else ""
+                bonus = t.get('bonus', 0)
+                penalty = t.get('penalty', 0)
+                corr_parts = []
+                if bonus > 0:
+                    corr_parts.append(f"+{bonus}")
+                if penalty > 0:
+                    corr_parts.append(f"-{penalty}")
+                corr_str = f" 修正: {', '.join(corr_parts)}" if corr_parts else ""
+                conflict_str = " ⚠冲突" if t.get('axis_conflict') else ""
+                print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} {base_str}{corr_str} "
+                      f"向量={t['vec']:.4f} {tl_info} 语义={t['emb']:.4f} 标签={t['tag']:.4f} 手术={t['surgery'] or '-'}{conflict_str}")
             else:
                 print(f"  [{i+1}] {t['id']} | 综合={t['final']:.4f} 向量={t['vec']:.4f} "
-                      f"病程={t['tl']:.4f} 摘要={t['text']:.4f} 手术={t['surgery'] or '-'}")
+                      f"{tl_info} 摘要={t['text']:.4f} 手术={t['surgery'] or '-'}")
 
     print(f"\n{'='*60}")
     print("评测完成")

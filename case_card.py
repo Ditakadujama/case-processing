@@ -29,6 +29,7 @@ class CaseCard:
     outcome: dict = field(default_factory=dict)
     severity_level: str = "unknown"
     summary_for_embedding: str = ""
+    disease_axis: List[str] = field(default_factory=list)  # 临床主题轴（1-3个，限定枚举）
 
     @classmethod
     def from_dict(cls, data: dict) -> "CaseCard":
@@ -47,6 +48,7 @@ class CaseCard:
             outcome=data.get("outcome", {}) or {},
             severity_level=data.get("severity_level", "unknown"),
             summary_for_embedding=data.get("summary_for_embedding", ""),
+            disease_axis=data.get("disease_axis", []) or [],
         )
 
     def to_dict(self) -> dict:
@@ -65,6 +67,7 @@ class CaseCard:
             "outcome": self.outcome,
             "severity_level": self.severity_level,
             "summary_for_embedding": self.summary_for_embedding,
+            "disease_axis": self.disease_axis,
         }
 
 
@@ -269,27 +272,282 @@ def jaccard_similarity(a: Set[str], b: Set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 临床主题轴 (disease_axis)
+# ═══════════════════════════════════════════════════════════════════
+
+VALID_DISEASE_AXES = {
+    "neuro_trauma",
+    "neuro_hemorrhage",
+    "neuro_infection",
+    "cardiac_surgery",
+    "aortic_disease",
+    "heart_failure",
+    "respiratory_failure",
+    "sepsis_abdominal",
+    "sepsis_pulmonary",
+    "sepsis_other",
+    "abdominal_bleeding",
+    "pancreatitis",
+    "hepatobiliary_disease",
+    "renal_failure",
+    "multi_trauma",
+    "postoperative_monitoring",
+    "other",
+}
+
+# 主题冲突组：同一组内的主题属于相近领域，跨组冲突才判为明显冲突
+AXIS_CONFLICT_GROUPS = [
+    {"neuro_trauma", "neuro_hemorrhage", "neuro_infection"},
+    {"cardiac_surgery", "aortic_disease", "heart_failure"},
+    {"sepsis_abdominal", "pancreatitis", "hepatobiliary_disease", "abdominal_bleeding"},
+    {"renal_failure"},
+    {"respiratory_failure", "sepsis_pulmonary"},
+    {"multi_trauma"},
+    {"postoperative_monitoring"},
+    {"other"},
+]
+
+
+def normalize_disease_axes(card: dict) -> List[str]:
+    """
+    清洗病例卡中的 disease_axis 字段：
+    - 不在枚举内的值删除
+    - 去重
+    - 最多保留 3 个
+    - 旧病例卡没有该字段时返回空列表
+    """
+    raw = card.get("disease_axis", []) or []
+    cleaned = []
+    seen = set()
+    for axis in raw:
+        axis = axis.strip().lower()
+        if axis in VALID_DISEASE_AXES and axis not in seen:
+            seen.add(axis)
+            cleaned.append(axis)
+    return cleaned[:3]
+
+
+def disease_axis_similarity(card_a: dict, card_b: dict) -> float:
+    """
+    计算两个病例卡的临床主题相似度。
+    至少一个交集 → 1.0；都没有 → 0.5（中性）；有但不交 → 0.0。
+    """
+    axes_a = set(normalize_disease_axes(card_a))
+    axes_b = set(normalize_disease_axes(card_b))
+    if not axes_a or not axes_b:
+        return 0.5  # 未知，不奖励也不重罚
+    if axes_a & axes_b:
+        return 1.0
+    return 0.0
+
+
+def _get_conflict_group(axis: str) -> Optional[int]:
+    """返回主题所属冲突组索引，不在任何组返回 None"""
+    for i, group in enumerate(AXIS_CONFLICT_GROUPS):
+        if axis in group:
+            return i
+    return None
+
+
+def has_disease_axis_conflict(card_a: dict, card_b: dict) -> bool:
+    """
+    判断两个病例卡的临床主题是否明显冲突。
+
+    两边均存在 disease_axis，但没有任何交集；
+    且双方主轴落在不同冲突组时返回 True。
+    """
+    axes_a = set(normalize_disease_axes(card_a))
+    axes_b = set(normalize_disease_axes(card_b))
+    if not axes_a or not axes_b:
+        return False
+    # 有交集则无冲突
+    if axes_a & axes_b:
+        return False
+    # 检查是否所有轴都落在不同冲突组
+    groups_a = set()
+    for a in axes_a:
+        g = _get_conflict_group(a)
+        if g is not None:
+            groups_a.add(g)
+    groups_b = set()
+    for b in axes_b:
+        g = _get_conflict_group(b)
+        if g is not None:
+            groups_b.add(g)
+    # 如果任一方无法归类，不判冲突（偏保守）
+    if not groups_a or not groups_b:
+        return False
+    # 无共同冲突组 = 跨主题冲突
+    return not bool(groups_a & groups_b)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 干预标签特异性加权
+# ═══════════════════════════════════════════════════════════════════
+
+GENERIC_INTERVENTION_TAGS = {
+    "机械通气",
+    "无创通气",
+    "升压药",
+    "吸氧",
+    "镇静镇痛",
+    "抗感染治疗",
+    "输血治疗",
+    "营养支持",
+    "留置导尿",
+}
+
+SPECIFIC_INTERVENTION_KEYWORDS = {
+    "CRRT",
+    "ECMO",
+    "IABP",
+    "PICCO监测",
+    "开颅",
+    "去骨瓣减压",
+    "脑室引流",
+    "腰大池引流",
+    "Bentall",
+    "主动脉弓置换",
+    "支架象鼻",
+    "肝脓肿穿刺引流",
+    "腹腔穿刺",
+    "腹腔引流",
+    "胰周穿刺引流",
+    "胸腔穿刺引流",
+    "TACE",
+}
+
+
+def is_specific_intervention(tag: str) -> bool:
+    """判断一个干预标签是否为特异干预（关键词包含匹配）"""
+    tag_lower = tag.lower()
+    return any(kw.lower() in tag_lower for kw in SPECIFIC_INTERVENTION_KEYWORDS)
+
+
+def intervention_weight(tag: str) -> float:
+    """
+    干预标签权重：
+    - 特异标签：3.0
+    - 泛化 ICU 标签：0.35
+    - 普通标签：1.0
+    """
+    if is_specific_intervention(tag):
+        return 3.0
+    if tag in GENERIC_INTERVENTION_TAGS:
+        return 0.35
+    return 1.0
+
+
+def weighted_intervention_overlap(tags_a: Set[str], tags_b: Set[str]) -> float:
+    """
+    加权干预 Jaccard：特异标签权重 3.0，普通 1.0，泛化 ICU 0.35。
+    """
+    if not tags_a and not tags_b:
+        return 0.5
+    if not tags_a or not tags_b:
+        return 0.0
+
+    union = tags_a | tags_b
+    inter = tags_a & tags_b
+
+    total_weight = sum(intervention_weight(t) for t in union)
+    inter_weight = sum(intervention_weight(t) for t in inter)
+
+    return inter_weight / total_weight if total_weight > 0 else 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 强共同标签判断
+# ═══════════════════════════════════════════════════════════════════
+
+def find_strong_common_tags(card_a: dict, card_b: dict) -> List[str]:
+    """
+    返回共同主诊断、共同特异干预、共同 disease_axis。
+    泛化 ICU 干预不算 strong tag。
+    """
+    strong = []
+
+    # 共同主诊断
+    diag_a = set()
+    for d in (card_a.get("primary_diagnoses") or []):
+        name = d if isinstance(d, str) else d.get("name", "")
+        if name:
+            diag_a.add(normalize_tag(name))
+    diag_b = set()
+    for d in (card_b.get("primary_diagnoses") or []):
+        name = d if isinstance(d, str) else d.get("name", "")
+        if name:
+            diag_b.add(normalize_tag(name))
+    common_diag = diag_a & diag_b
+    for d in sorted(common_diag):
+        strong.append(f"诊断:{d}")
+
+    # 共同特异干预
+    interv_a, interv_b = set(), set()
+    for item in (card_a.get("key_interventions") or []):
+        name = item.get("normalized_name", "") or item.get("name", "")
+        if name:
+            interv_a.add(normalize_tag(name))
+    for item in (card_a.get("surgery_or_operations") or []):
+        name = item.get("normalized_name", "") or item.get("name", "")
+        if name:
+            interv_a.add(normalize_tag(name))
+    for item in (card_b.get("key_interventions") or []):
+        name = item.get("normalized_name", "") or item.get("name", "")
+        if name:
+            interv_b.add(normalize_tag(name))
+    for item in (card_b.get("surgery_or_operations") or []):
+        name = item.get("normalized_name", "") or item.get("name", "")
+        if name:
+            interv_b.add(normalize_tag(name))
+
+    common_interv = interv_a & interv_b
+    for tag in sorted(common_interv):
+        if is_specific_intervention(tag):
+            strong.append(f"特异干预:{tag}")
+
+    # 共同 disease_axis
+    axes_a = set(normalize_disease_axes(card_a))
+    axes_b = set(normalize_disease_axes(card_b))
+    for axis in sorted(axes_a & axes_b):
+        strong.append(f"主题:{axis}")
+
+    return strong
+
+
+def has_strong_common_tag(card_a: dict, card_b: dict) -> bool:
+    """是否有强共同标签（主诊断 / 特异干预 / disease_axis 交集）"""
+    return bool(find_strong_common_tags(card_a, card_b))
+
+
+
 def tag_overlap_score(card_a: dict, card_b: dict) -> float:
     """
     计算两个病例卡的标签重叠相似度。
 
-    加权 Jaccard：
-      0.30 × 诊断 Jaccard
-    + 0.35 × 干预 Jaccard
+    加权 Jaccard（v1.1 更新）：
+      0.35 × 诊断 Jaccard（主诊断是临床主题的直接信号）
+    + 0.30 × 加权干预得分（特异标签 3.0、泛化 ICU 0.35、普通 1.0）
     + 0.20 × 器官功能 Jaccard
-    + 0.15 × 并发症 Jaccard
-
-    干预权重最高（ICU 病程相似往往由机械通气、CRRT、IABP、升压药等决定）。
-    并发症权重最低（抽取难度大，但保留信号）。
+    + 0.10 × 并发症 Jaccard（噪声相对更大）
+    + 0.05 × disease_axis 得分
     """
     diag_a, interv_a, compl_a, organ_a = extract_tag_sets(card_a)
     diag_b, interv_b, compl_b, organ_b = extract_tag_sets(card_b)
 
+    # 加权干预得分
+    interv_score = weighted_intervention_overlap(interv_a, interv_b)
+
+    # disease_axis 得分（归一化到 0-1）
+    axis_score = disease_axis_similarity(card_a, card_b)
+
     return (
-        0.30 * jaccard_similarity(diag_a, diag_b) +
-        0.35 * jaccard_similarity(interv_a, interv_b) +
+        0.35 * jaccard_similarity(diag_a, diag_b) +
+        0.30 * interv_score +
         0.20 * jaccard_similarity(organ_a, organ_b) +
-        0.15 * jaccard_similarity(compl_a, compl_b)
+        0.10 * jaccard_similarity(compl_a, compl_b) +
+        0.05 * axis_score
     )
 
 

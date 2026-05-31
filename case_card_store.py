@@ -16,7 +16,7 @@ from config import DBConfig
 logger = logging.getLogger(__name__)
 
 # 当前病例卡抽取器版本号，prompt/schema 变化时递增
-DEFAULT_EXTRACTOR_VERSION = "v1.0"
+DEFAULT_EXTRACTOR_VERSION = "v1.1"
 
 # 建表 SQL
 CREATE_TABLE_SQL = """

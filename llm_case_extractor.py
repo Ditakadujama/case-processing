@@ -359,6 +359,9 @@ CASE_CARD_SCHEMA = """
   "icu_reason": "进入ICU/重症监护的核心原因",
   "primary_diagnoses": ["主诊断1", "主诊断2"],
   "secondary_diagnoses": ["基础病或次要诊断"],
+  "disease_axis": [
+    "从限定枚举中选择 1-3 个最核心临床主题。可选值：neuro_trauma / neuro_hemorrhage / neuro_infection / cardiac_surgery / aortic_disease / heart_failure / respiratory_failure / sepsis_abdominal / sepsis_pulmonary / sepsis_other / abdominal_bleeding / pancreatitis / hepatobiliary_disease / renal_failure / multi_trauma / postoperative_monitoring / other"
+  ],
   "surgery_or_operations": [
     {
       "name": "手术/操作名称",
@@ -400,7 +403,7 @@ CASE_CARD_SCHEMA = """
     "evidence": "原文依据或空字符串"
   },
   "severity_level": "critical/severe/moderate/mild/unknown",
-  "summary_for_embedding": "用于语义检索的事实摘要，100-300字，包含：人口学信息、主要诊断、关键干预、器官功能问题、并发症、转归。不得加入推测。"
+  "summary_for_embedding": "用于语义检索的事实摘要，150-350字。必须按以下顺序：主病因/主诊断；核心病理过程；进入ICU原因；特异手术或操作；关键器官功能障碍；高级生命支持；已确认并发症；转归。优先写疾病主题和特异操作，机械通气、升压药、镇静、输血、营养支持等ICU共性放在摘要后半部分。不要让泛化ICU支持措施占据摘要主体。不得加入推测。"
 }
 """
 
@@ -420,6 +423,12 @@ ICU 病历常见模式提示：
 - 并发症注意区分：已确诊的感染（肺部感染/血流感染等）、血栓/栓塞、出血事件等
 - 手术/操作请从手术记录或操作记录中提取，注意区分手术和床边操作
 - 如果病历中记录了患者死亡，outcome.status 应为 "死亡"；如果转出ICU，应为 "转出"
+
+disease_axis 字段说明：
+- disease_axis 表示决定病例检索主题的核心临床问题，不是列举所有并发症。
+- 机械通气、升压药、贫血、电解质紊乱等一般不应单独作为 disease_axis。
+- 最多选择 3 个，优先选择病因和关键病理过程。
+- 例如：肝脓肿+脓毒症应选 sepsis_abdominal 和 hepatobiliary_disease；颅脑外伤+开颅应选 neuro_trauma；主动脉夹层+Bentall手术应选 aortic_disease 和 cardiac_surgery。
 """
 
 
@@ -783,6 +792,7 @@ def validate_case_card(card: dict, source_text: str) -> dict:
     card.setdefault("outcome", {"status": "unknown", "evidence": ""})
     card.setdefault("severity_level", "unknown")
     card.setdefault("summary_for_embedding", "")
+    card.setdefault("disease_axis", [])
 
     # ── 2. summary_for_embedding 非空检查（P2-8: 改进兜底质量）──
     summary = card.get("summary_for_embedding", "")
@@ -844,6 +854,10 @@ def validate_case_card(card: dict, source_text: str) -> dict:
         else:
             card["summary_for_embedding"] = "无有效摘要"
             card["_summary_low_quality"] = True
+
+    # ── 2.5 disease_axis 清洗（v1.1 新增）──
+    from case_card import normalize_disease_axes
+    card["disease_axis"] = normalize_disease_axes(card)
 
     # ── 3. evidence 校验 ──
     card = _validate_evidence_items(card, "surgery_or_operations", source_text)
