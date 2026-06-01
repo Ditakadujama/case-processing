@@ -490,6 +490,10 @@ class MedicalRecordSimilaritySystem:
                     print(f"  查询 embedding 生成失败: {e}")
                     query_embedding = None
 
+        # 系统级开关：是否启用了标签/embedding 增强（用于结果展示判断）
+        use_embedding = has_embeddings and query_embedding is not None
+        use_tag = has_case_cards and query_card is not None
+
         # ── 第一阶段：多路候选召回 ──
         # 1. 结构化向量候选
         vector_top_k = min(max(top_k * 20, 100), len(self.record_order))
