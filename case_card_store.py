@@ -187,9 +187,13 @@ class MySQLCaseCardStore:
         finally:
             conn.close()
 
-    def load_all(self) -> Dict[str, dict]:
+    def load_all(self, extractor_version: str = None) -> Dict[str, dict]:
         """
         加载所有病例卡（不含 embedding 向量）。
+
+        Args:
+            extractor_version: 可选，只加载指定版本的病例卡。
+                              不指定则加载全部（兼容旧数据）。
 
         Returns:
             {record_id: case_card_dict, ...}
@@ -197,9 +201,16 @@ class MySQLCaseCardStore:
         conn = self._get_conn()
         try:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT record_id, case_card_json FROM record_case_cards"
-                )
+                if extractor_version:
+                    cursor.execute(
+                        """SELECT record_id, case_card_json FROM record_case_cards
+                           WHERE extractor_version = %s""",
+                        (extractor_version,)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT record_id, case_card_json FROM record_case_cards"
+                    )
                 result = {}
                 for row in cursor.fetchall():
                     record_id = row["record_id"]
@@ -210,9 +221,13 @@ class MySQLCaseCardStore:
         finally:
             conn.close()
 
-    def load_all_embeddings(self) -> Tuple[np.ndarray, List[str]]:
+    def load_all_embeddings(self, extractor_version: str = None) -> Tuple[np.ndarray, List[str]]:
         """
         加载所有预计算的 embedding 向量。
+
+        Args:
+            extractor_version: 可选，只加载指定版本的 embedding。
+                              不指定则加载全部。
 
         Returns:
             (N×D float32 matrix, [record_id, ...])
@@ -221,10 +236,17 @@ class MySQLCaseCardStore:
         conn = self._get_conn()
         try:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """SELECT record_id, embedding FROM record_case_cards
-                       WHERE embedding IS NOT NULL"""
-                )
+                if extractor_version:
+                    cursor.execute(
+                        """SELECT record_id, embedding FROM record_case_cards
+                           WHERE embedding IS NOT NULL AND extractor_version = %s""",
+                        (extractor_version,)
+                    )
+                else:
+                    cursor.execute(
+                        """SELECT record_id, embedding FROM record_case_cards
+                           WHERE embedding IS NOT NULL"""
+                    )
                 rows = cursor.fetchall()
                 if not rows:
                     return np.array([], dtype=np.float32), []

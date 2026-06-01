@@ -521,6 +521,33 @@ def has_strong_common_tag(card_a: dict, card_b: dict) -> bool:
     return bool(find_strong_common_tags(card_a, card_b))
 
 
+def has_real_tag_overlap(card_a: dict, card_b: dict) -> bool:
+    """
+    判断两个病例卡的四类标签是否存在真实交集（非中性回退值）。
+
+    与 tag_overlap_score 不同：jaccard_similarity 在双方都为空时返回 0.5（中性），
+    导致 tag_overlap_score 几乎不会为 0。本函数直接检查四类标签是否有真实交集，
+    用于判断"完全没有共同标签"的惩罚条件。
+
+    Returns:
+        True 如果诊断/干预/器官功能/并发症中至少有一组存在真实交集。
+    """
+    diag_a, interv_a, compl_a, organ_a = extract_tag_sets(card_a)
+    diag_b, interv_b, compl_b, organ_b = extract_tag_sets(card_b)
+
+    # 真实交集：两边都非空且有共同元素
+    if diag_a and diag_b and (diag_a & diag_b):
+        return True
+    if interv_a and interv_b and (interv_a & interv_b):
+        return True
+    if organ_a and organ_b and (organ_a & organ_b):
+        return True
+    if compl_a and compl_b and (compl_a & compl_b):
+        return True
+
+    return False
+
+
 
 def tag_overlap_score(card_a: dict, card_b: dict) -> float:
     """

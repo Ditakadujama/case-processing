@@ -50,17 +50,20 @@ def main():
     if timeline_days > 0:
         print(f"病程窗口模式: 前 {timeline_days} 天 (权重 {timeline_window_weight})")
 
-    # 自动检测 LLM 病例卡数据
-    from case_card_store import MySQLCaseCardStore
+    # 自动检测 LLM 病例卡数据（只读取当前版本，防止 v1.0/v1.1 混用导致统计失真）
+    from case_card_store import MySQLCaseCardStore, DEFAULT_EXTRACTOR_VERSION
     enable_llm = False
     case_cards = {}
     try:
         cc_store = MySQLCaseCardStore(cfg)
         cc_store.init_table()
-        if cc_store.count() > 0:
+        # 只加载当前版本的病例卡，与 main.py search 逻辑保持一致
+        case_cards = cc_store.load_all(extractor_version=DEFAULT_EXTRACTOR_VERSION)
+        if case_cards:
             enable_llm = True
-            case_cards = cc_store.load_all()
-            print(f"检测到病例卡数据 ({cc_store.count()} 条)，启用 LLM 增强评测")
+            print(f"检测到 {DEFAULT_EXTRACTOR_VERSION} 病例卡数据 ({len(case_cards)} 条)，启用 LLM 增强评测")
+        elif cc_store.count() > 0:
+            print(f"注意: 病例卡表有 {cc_store.count()} 条但非当前版本，评测将不使用 LLM 增强")
     except Exception:
         pass
 
@@ -180,11 +183,15 @@ def main():
                 axis_sim_val = r.get('disease_axis_similarity', 0)
                 if isinstance(axis_sim_val, (int, float)) and axis_sim_val >= 1.0:
                     axis_match_count += 1
-                # tag_overlap=0 且无强共同标签
-                if isinstance(tag_sim, (int, float)) and tag_sim == 0.0:
-                    strong = r.get('strong_common_tags', [])
-                    if not strong:
-                        strong_tag_zero_count += 1
+                # P1 修复：用真实标签交集判断替代 tag_overlap_sim == 0.0
+                if q_card:
+                    c_card = case_cards.get(r['id'])
+                    if c_card:
+                        from case_card import has_real_tag_overlap
+                        if not has_real_tag_overlap(q_card, c_card):
+                            strong = r.get('strong_common_tags', [])
+                            if not strong:
+                                strong_tag_zero_count += 1
 
                 # Jaccard 指标（查询 vs 候选）
                 if q_card:

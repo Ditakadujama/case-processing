@@ -23,6 +23,7 @@ from case_card import (
     tag_overlap_score, find_common_and_diff_tags,
     disease_axis_similarity, has_disease_axis_conflict,
     find_strong_common_tags, has_strong_common_tag,
+    has_real_tag_overlap,
 )
 from embedding_index import EmbeddingService, cosine_similarity, batch_cosine_similarity
 
@@ -264,12 +265,13 @@ class MedicalRecordSimilaritySystem:
                 surgery_keywords_hint=parsed_record.surgery_keywords or None
             )
 
-        # 添加到内存索引
-        self.index.add(features.reshape(1, -1))
+        # 添加到内存索引（P2 修复：已存在记录不重复追加）
+        if record_id not in self.record_order:
+            self.index.add(features.reshape(1, -1))
 
         # 写入 MySQL
         store = self._get_store()
-        order_idx = len(self.record_order)
+        order_idx = self.record_order.index(record_id) if record_id in self.record_order else len(self.record_order)
         store.insert(record_id, features, text, timeline_features, order_idx)
 
         # 更新缓存
@@ -277,7 +279,8 @@ class MedicalRecordSimilaritySystem:
             'text': text,
             'timeline_features': timeline_features,
         }
-        self.record_order.append(record_id)
+        if record_id not in self.record_order:
+            self.record_order.append(record_id)
 
     def add_records_batch(self, records: Dict[str, str], num_workers: int = 1,
                           executor: ProcessPoolExecutor = None) -> None:
@@ -324,7 +327,14 @@ class MedicalRecordSimilaritySystem:
             return
 
         # ── 阶段3：向量入内存索引 ──
-        self.index.add(features)
+        # P2 修复：过滤已存在记录，防止调试增量构建重复追加
+        existing_ids = set(self.record_order)
+        if existing_ids:
+            new_indices = [i for i, (rid, _) in enumerate(records_list) if rid not in existing_ids]
+            if new_indices:
+                self.index.add(features[new_indices])
+        else:
+            self.index.add(features)
 
         # ── 阶段4：时间轴预计算 ──
         if workers > 1:
@@ -357,12 +367,16 @@ class MedicalRecordSimilaritySystem:
         # 注意：build 阶段不填充 _metadata_cache（内存膨胀会导致 fork 越来越慢）
         # 缓存由 search 启动时通过 load_all_metadata() 从 MySQL 加载
         store = self._get_store()
-        base_order = len(self.record_order)
         insert_rows = []
         for i, (record_id, text) in enumerate(records_list):
             tl_feat = timeline_map[record_id][2]
-            insert_rows.append((record_id, features[i], text, tl_feat, base_order + i))
-            self.record_order.append(record_id)
+            if record_id in existing_ids:
+                # P2 修复：已存在记录保持原有 order_idx（MySQL ON DUPLICATE KEY UPDATE）
+                order_idx = self.record_order.index(record_id)
+            else:
+                order_idx = len(self.record_order)
+                self.record_order.append(record_id)
+            insert_rows.append((record_id, features[i], text, tl_feat, order_idx))
         store.insert_sequential(insert_rows)
 
     def save(self) -> None:
@@ -501,10 +515,12 @@ class MedicalRecordSimilaritySystem:
                 embedding_candidate_ids.add(emb_id)
                 embedding_score_by_id[emb_id] = float(emb_scores[ei])
 
-        # 3. 合并候选集合（并集）
+        # 3. 合并候选集合（并集），限制在当前向量底库中
         candidate_ids = set(vector_candidate_indices)
         candidate_ids.update(embedding_candidate_ids)
         candidate_ids -= exclude_record_ids
+        # 裁剪：只保留当前 vector DB 中实际存在的记录（防止旧 embedding 召回到已删除病例）
+        candidate_ids.intersection_update(self._metadata_cache.keys())
 
         # ── 第二阶段：多维度重排序 ──
         candidates = []
@@ -583,10 +599,17 @@ class MedicalRecordSimilaritySystem:
                     tag_overlap_sim = tag_overlap_score(query_card, cand_card)
 
             # ── 融合公式（P1-6: 按可用信号灵活组合）──
-            use_embedding = has_embeddings and query_embedding is not None
-            use_tag = has_case_cards and query_card is not None
+            # P1 修复：候选级开关，避免"部分候选无病例卡/embedding"时权重分配不公
+            cand_has_embedding = (
+                has_embeddings and query_embedding is not None and
+                (record_id in embedding_score_by_id or record_id in self._embedding_id_to_idx)
+            )
+            cand_has_card = (
+                has_case_cards and query_card is not None and
+                record_id in self._case_card_cache
+            )
 
-            if use_embedding and use_tag:
+            if cand_has_embedding and cand_has_card:
                 # 完整四路融合 (v1.1: timeline 0.40→0.30, tag 0.10→0.20)
                 base_sim = (
                     0.15 * vector_sim +
@@ -594,14 +617,14 @@ class MedicalRecordSimilaritySystem:
                     0.35 * embedding_sim +
                     0.20 * tag_overlap_sim
                 )
-            elif use_embedding:
+            elif cand_has_embedding:
                 # 有 embedding 但无标签
                 base_sim = (
                     0.20 * vector_sim +
                     0.35 * timeline_sim +
                     0.45 * embedding_sim
                 )
-            elif use_tag:
+            elif cand_has_card:
                 # 有病例卡标签但无 embedding
                 base_sim = (
                     0.20 * vector_sim +
@@ -626,7 +649,7 @@ class MedicalRecordSimilaritySystem:
             axis_conflict = False
             axis_sim = 0.5  # 默认中性
 
-            if use_tag and query_card:
+            if cand_has_card:
                 cand_card = self._case_card_cache.get(record_id)
                 if cand_card:
                     axis_sim = disease_axis_similarity(query_card, cand_card)
@@ -638,11 +661,16 @@ class MedicalRecordSimilaritySystem:
                     if axis_sim == 1.0:
                         ranking_bonus += 0.03
 
-                    if tag_overlap_sim == 0.0 and not has_strong_common_tag(query_card, cand_card):
-                        ranking_penalty += 0.04
+                    # P1 修复：用真实标签交集判断，而非 tag_overlap_sim == 0.0
+                    # （jaccard_similarity 在双方为空时回退 0.5，导致 tag_overlap_score 几乎不会为 0）
+                    has_real_overlap = has_real_tag_overlap(query_card, cand_card)
+                    has_strong = has_strong_common_tag(query_card, cand_card)
 
-                    # P0: 仅有泛化共同标签，无诊断/特异干预交集
-                    if tag_overlap_sim > 0 and not has_strong_common_tag(query_card, cand_card):
+                    if not has_real_overlap and not has_strong:
+                        # 四类标签（诊断/干预/器官/并发症）完全无真实交集
+                        ranking_penalty += 0.04
+                    elif not has_strong:
+                        # 有浅层共同标签但无强共同标签（仅有泛化 ICU 标签交集）
                         ranking_penalty += 0.02
 
             final_sim = max(0.0, min(1.0, base_sim + ranking_bonus - ranking_penalty))
@@ -841,8 +869,9 @@ class MedicalRecordSimilaritySystem:
             self._load_case_cards()
 
     def _load_case_cards(self) -> None:
-        """加载病例卡和 embedding 到内存缓存"""
+        """加载病例卡和 embedding 到内存缓存（只加载当前 extractor_version，防止新旧混用）"""
         try:
+            from case_card_store import DEFAULT_EXTRACTOR_VERSION
             cc_store = self._get_case_card_store()
             card_count = cc_store.count()
             if card_count == 0:
@@ -850,12 +879,12 @@ class MedicalRecordSimilaritySystem:
                 self.enable_llm = False
                 return
 
-            # 加载病例卡（P1-6: 与 embedding 解耦，独立加载）
-            self._case_card_cache = cc_store.load_all()
-            print(f"加载了 {len(self._case_card_cache)} 条病例卡")
+            # 只加载当前版本的病例卡，避免 v1.0/v1.1 混用导致 disease_axis 纠偏不稳定
+            self._case_card_cache = cc_store.load_all(extractor_version=DEFAULT_EXTRACTOR_VERSION)
+            print(f"加载了 {len(self._case_card_cache)} 条病例卡 (版本={DEFAULT_EXTRACTOR_VERSION})")
 
-            # 加载 embedding 向量
-            emb_vectors, emb_ids = cc_store.load_all_embeddings()
+            # 同样按版本加载 embedding 向量
+            emb_vectors, emb_ids = cc_store.load_all_embeddings(extractor_version=DEFAULT_EXTRACTOR_VERSION)
             if emb_vectors.size > 0:
                 self._embedding_cache = emb_vectors
                 self._embedding_ids = emb_ids

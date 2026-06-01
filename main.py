@@ -93,20 +93,25 @@ def build_index(num_workers: int = 1,
         print("未找到有效病历，请先运行 data_migrate/migrate_xlsx_to_mysql.py 导入原始数据")
         return
 
-    # 限制条数
-    if limit > 0:
+    # 限制条数（调试模式：默认禁止清空全表，避免误删完整底库）
+    is_debug_mode = limit > 0
+    if is_debug_mode:
         records = dict(list(records.items())[:limit])
-        print(f"限制处理 {limit} 条记录")
+        print(f"限制处理 {limit} 条记录（调试模式：不清空现有向量库）")
 
-    # 清空旧向量数据
+    # 清空旧向量数据（全量构建时；调试模式跳过）
     store = MySQLVectorStore(cfg)
     store.init_table()
-    store.delete_all()
-
-    # LLM + Embedding 初始化
     cc_store = MySQLCaseCardStore(cfg)
     cc_store.init_table()
-    print(f"病例卡表已就绪，当前记录数: {cc_store.count()}")
+    if not is_debug_mode:
+        store.delete_all()
+        # 全量重建时同步清空病例卡表，防止原始库删除病例后旧 embedding 仍参与召回
+        cc_store.delete_all()
+        print("已清空 record_vectors 和 record_case_cards 表")
+    else:
+        print(f"跳过清空，当前 record_vectors 表共 {store.count()} 条")
+        print(f"病例卡表已就绪，当前记录数: {cc_store.count()}")
 
     llm_extractor = LLMCaseExtractor(llm_cfg)
     emb_service = EmbeddingService(emb_cfg)
@@ -235,18 +240,26 @@ def _extract_case_cards_batch(batch: dict, llm_extractor, emb_service,
             with cache_lock:
                 system._case_card_cache[record_id] = card
                 if embedding is not None and system._embedding_cache is not None:
-                    system._embedding_ids.append(record_id)
-                    system._embedding_id_to_idx[record_id] = len(system._embedding_ids) - 1
                     emb_norm = embedding.astype(np.float64)
                     norm = np.linalg.norm(emb_norm)
                     if norm > 0:
                         emb_norm = emb_norm / norm
-                    if system._embedding_cache.size == 0:
-                        system._embedding_cache = emb_norm.reshape(1, -1).astype(np.float32)
+                    emb_row = emb_norm.astype(np.float32).reshape(1, -1)
+
+                    if record_id in system._embedding_id_to_idx:
+                        # 增量重建：覆盖已有位置，避免重复追加
+                        idx = system._embedding_id_to_idx[record_id]
+                        system._embedding_cache[idx] = emb_row
                     else:
-                        system._embedding_cache = np.vstack([
-                            system._embedding_cache, emb_norm.astype(np.float32).reshape(1, -1)
-                        ])
+                        # 新记录：追加
+                        system._embedding_ids.append(record_id)
+                        system._embedding_id_to_idx[record_id] = len(system._embedding_ids) - 1
+                        if system._embedding_cache.size == 0:
+                            system._embedding_cache = emb_row
+                        else:
+                            system._embedding_cache = np.vstack([
+                                system._embedding_cache, emb_row
+                            ])
 
             return "success"
 
@@ -312,14 +325,20 @@ def search(timeline_days: int = 0, timeline_window_weight: float = 0.55):
 
     cfg = DBConfig.from_env()
 
-    # 自动检测是否有病例卡数据
+    # 自动检测是否有当前版本的病例卡数据（防止 v1.0/v1.1 混用）
     enable_llm = False
     try:
+        from case_card_store import DEFAULT_EXTRACTOR_VERSION
         cc_store = MySQLCaseCardStore(cfg)
         cc_store.init_table()
-        if cc_store.count() > 0:
+        # 只统计当前版本的病例卡，避免旧版本无 disease_axis 导致纠偏不稳定
+        current_version_cards = cc_store.load_all(extractor_version=DEFAULT_EXTRACTOR_VERSION)
+        if current_version_cards:
             enable_llm = True
-            print(f"检测到病例卡数据 ({cc_store.count()} 条)，启用 LLM 增强检索")
+            print(f"检测到 v1.1 病例卡数据 ({len(current_version_cards)} 条)，启用 LLM 增强检索")
+        elif cc_store.count() > 0:
+            print(f"注意: 病例卡表有 {cc_store.count()} 条记录但非当前版本 ({DEFAULT_EXTRACTOR_VERSION})，"
+                  f"请 rebuild 以启用 LLM 增强")
     except Exception:
         pass
 
