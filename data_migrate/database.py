@@ -4,10 +4,16 @@ MySQL 数据库访问模块
 """
 
 import os
+import sys
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 from contextlib import contextmanager
+
+# 将项目根目录加入 sys.path，确保 data_migrate/ 子目录中也能导入项目根目录的 config 模块
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 try:
     import pymysql

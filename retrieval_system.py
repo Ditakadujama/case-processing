@@ -532,6 +532,12 @@ class MedicalRecordSimilaritySystem:
             # 结构化向量分：候选来自 embedding 但没有向量分时用 0.0
             vector_sim = vector_score_by_id.get(record_id, 0.0)
 
+            # 向量自匹配检测：105 维连续特征向量完全相同 → 几乎肯定是同一病例
+            # 弥补 query_id 与 DB record_id 命名不一致导致的自排除失效
+            # （如 query 文件 ZY010101665239.txt vs DB ZY0101016652391，后者多就诊序号）
+            if vector_sim >= 0.999:
+                continue
+
             cand_data = self._metadata_cache.get(record_id, {})
             text = cand_data.get('text', '')
             cand_full_features = self._timeline_features_for_candidate(

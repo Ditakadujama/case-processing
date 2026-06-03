@@ -116,6 +116,10 @@ class LLMConfig:
     temperature: float = 0.0
     timeout: int = field(default_factory=lambda: int(os.environ.get("LLM_TIMEOUT", "120")))
     max_retries: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_RETRIES", "3")))
+    enable_json_repair: bool = field(default_factory=lambda: os.environ.get("LLM_ENABLE_JSON_REPAIR", "1") != "0")
+    save_failed_raw: bool = field(default_factory=lambda: os.environ.get("LLM_SAVE_FAILED_RAW", "1") != "0")
+    failed_raw_dir: str = field(default_factory=lambda: os.environ.get("LLM_FAILED_RAW_DIR", "data/llm_failures"))
+    response_format_json: bool = field(default_factory=lambda: os.environ.get("LLM_RESPONSE_FORMAT_JSON", "0") == "1")
 
     @property
     def is_configured(self) -> bool:

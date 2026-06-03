@@ -416,6 +416,8 @@ EXTRACTION_SYSTEM_PROMPT = """你是 ICU 临床病历信息抽取专家。请只
 4. 严格区分"已经发生"与"风险告知/知情同意"：知情同意书中列出的潜在并发症风险绝不能当作已发生的并发症，除非病程记录、检查报告或诊断明确写明已经发生。
 5. summary_for_embedding 必须是纯事实摘要，不得加入任何推测或模型自己的医学判断。
 6. 输出必须是严格的 JSON，不要包含 markdown 代码块标记（如 ```json），不要加任何解释性文字。直接输出 JSON 对象。
+7. 控制输出长度：primary_diagnoses 最多 5 项，secondary_diagnoses 最多 8 项，surgery_or_operations/key_interventions/organ_failures/complications 各最多 8 项，clinical_course 最多 6 个阶段。
+8. evidence 字段只引用最短可核验原文片段，单条 evidence 建议 20-80 字，不要粘贴整段病程。
 
 ICU 病历常见模式提示：
 - 关键干预优先识别：机械通气（气管插管/呼吸机）、CRRT/血滤/透析、IABP/主动脉内球囊反搏、ECMO、升压药（去甲肾上腺素/多巴胺等）、PICCO监测
@@ -476,6 +478,7 @@ class LLMCaseExtractor:
         self._request_count = 0
         self._error_count = 0
         self._total_tokens = 0
+        self._last_response_meta: Dict[str, object] = {}
 
     @property
     def is_available(self) -> bool:
@@ -509,7 +512,17 @@ class LLMCaseExtractor:
         raw_response = self._call_llm(user_prompt)
 
         # 4. 解析 JSON
-        card = self._parse_json_response(raw_response, record_id)
+        card = self._parse_json_response(raw_response, record_id, log_failure=False)
+        if card is None:
+            self._log_json_parse_failure(raw_response, record_id, stage="initial")
+            if self.config.enable_json_repair:
+                repaired_response = self._repair_json_response(raw_response, record_id)
+                card = self._parse_json_response(repaired_response, record_id, log_failure=False)
+                if card is None:
+                    self._log_json_parse_failure(repaired_response, record_id, stage="repair")
+                else:
+                    logger.info(f"[{record_id}] JSON 修复成功")
+
         if card is None:
             return None
 
@@ -519,22 +532,26 @@ class LLMCaseExtractor:
 
         return card
 
-    def _call_llm(self, user_prompt: str) -> str:
+    def _call_llm(self, user_prompt: str, system_prompt: str = EXTRACTION_SYSTEM_PROMPT) -> str:
         """调用 OpenAI-compatible Chat Completions API"""
         import urllib.request
         import urllib.error
 
         url = f"{self.config.api_base.rstrip('/')}/chat/completions"
 
-        payload = json.dumps({
+        payload_dict = {
             "model": self.config.model,
             "messages": [
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
-        }).encode("utf-8")
+        }
+        if self.config.response_format_json:
+            payload_dict["response_format"] = {"type": "json_object"}
+
+        payload = json.dumps(payload_dict).encode("utf-8")
 
         for attempt in range(self.config.max_retries):
             try:
@@ -549,7 +566,14 @@ class LLMCaseExtractor:
                 self._total_tokens += usage.get("total_tokens", 0)
                 self._request_count += 1
 
-                content = body["choices"][0]["message"]["content"]
+                choice = body["choices"][0]
+                self._last_response_meta = {
+                    "finish_reason": choice.get("finish_reason"),
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "total_tokens": usage.get("total_tokens"),
+                }
+                content = choice["message"]["content"]
                 return content.strip()
 
             except urllib.error.HTTPError as e:
@@ -582,40 +606,99 @@ class LLMCaseExtractor:
         self._error_count += 1
         return ""
 
-    def _parse_json_response(self, raw: str, record_id: str) -> Optional[dict]:
+    def _parse_json_response(self, raw: str, record_id: str, log_failure: bool = True) -> Optional[dict]:
         """解析 LLM 返回的 JSON 字符串，处理常见格式问题"""
         if not raw:
             logger.warning(f"[{record_id}] LLM 返回空响应")
             return None
 
-        # 尝试直接解析
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
+        candidates = []
 
-        # 尝试移除 markdown 代码块标记
-        cleaned = raw
-        # 移除 ```json ... ``` 或 ``` ... ```
-        cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=re.MULTILINE)
-        cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
+        # 1. 原始文本
+        candidates.append(raw)
 
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            pass
+        # 2. 移除 markdown 代码块标记
+        cleaned = re.sub(r'^```(?:json)?\s*\n?', '', raw.strip(), flags=re.MULTILINE)
+        cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE).strip()
+        candidates.append(cleaned)
 
-        # 尝试提取第一个 { 到最后一个 } 之间的内容
+        # 3. 提取第一个 { 到最后一个 } 之间的内容
         first_brace = cleaned.find('{')
         last_brace = cleaned.rfind('}')
         if first_brace >= 0 and last_brace > first_brace:
-            try:
-                return json.loads(cleaned[first_brace:last_brace + 1])
-            except json.JSONDecodeError:
-                pass
+            candidates.append(cleaned[first_brace:last_brace + 1])
 
-        logger.warning(f"[{record_id}] JSON 解析失败，原始响应前 200 字符: {raw[:200]}")
+        # 4. 修复常见尾逗号
+        candidates.extend(re.sub(r",\s*([}\]])", r"\1", c) for c in list(candidates))
+
+        seen = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
+        if log_failure:
+            self._log_json_parse_failure(raw, record_id, stage="parse")
         return None
+
+    def _repair_json_response(self, raw: str, record_id: str) -> str:
+        """让 LLM 只修复 JSON 格式，不重新抽取医学信息。"""
+        if not raw:
+            return ""
+
+        repair_system_prompt = (
+            "你是严格 JSON 修复器。用户会提供一个本应为 JSON 对象的文本。"
+            "你只能修复 JSON 语法问题，必须保留原始字段和值，不要补充医学信息，"
+            "不要解释，不要输出 markdown，只输出一个完整合法的 JSON 对象。"
+        )
+        repair_prompt = (
+            "下面的文本 json.loads 失败。请只修复格式问题，输出完整合法 JSON 对象。\n\n"
+            f"病历 ID：{record_id}\n\n"
+            f"原始文本：\n{raw}"
+        )
+
+        try:
+            return self._call_llm(repair_prompt, system_prompt=repair_system_prompt)
+        except Exception as e:
+            logger.warning(f"[{record_id}] JSON 修复调用失败: {e}")
+            return ""
+
+    def _log_json_parse_failure(self, raw: str, record_id: str, stage: str) -> None:
+        """记录解析失败诊断信息，并按配置保存原始响应。"""
+        raw = raw or ""
+        meta = ", ".join(
+            f"{k}={v}" for k, v in self._last_response_meta.items() if v is not None
+        ) or "no_response_meta"
+        head = raw[:300].replace("\n", "\\n")
+        tail = raw[-500:].replace("\n", "\\n") if len(raw) > 500 else head
+
+        logger.warning(
+            f"[{record_id}] JSON 解析失败(stage={stage}, raw_len={len(raw)}, {meta}); "
+            f"head={head}; tail={tail}"
+        )
+
+        if not self.config.save_failed_raw:
+            return
+
+        try:
+            failure_dir = self.config.failed_raw_dir
+            os.makedirs(failure_dir, exist_ok=True)
+            safe_record_id = re.sub(r"[^0-9A-Za-z_.-]+", "_", record_id or "unknown")
+            filename = f"{safe_record_id}_{stage}.txt"
+            path = os.path.join(failure_dir, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"record_id: {record_id}\n")
+                f.write(f"stage: {stage}\n")
+                f.write(f"meta: {self._last_response_meta}\n")
+                f.write("\n--- raw response ---\n")
+                f.write(raw)
+            logger.warning(f"[{record_id}] 已保存 JSON 解析失败原始响应: {path}")
+        except Exception as e:
+            logger.warning(f"[{record_id}] 保存 JSON 解析失败原始响应失败: {e}")
 
     def get_stats(self) -> dict:
         """返回抽取器统计信息"""
