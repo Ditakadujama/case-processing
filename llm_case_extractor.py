@@ -2,7 +2,7 @@
 LLM 病例卡抽取器 — 从原始病历中提取结构化病例卡。
 
 流程：
-  1. extract_llm_context(text) → 从长病历中压缩提取 LLM 输入上下文
+  1. extract_llm_context(text) → 轻量清洗非临床噪声后保留长上下文
   2. build_case_card_prompt(context, record_id) → 构建 prompt
   3. LLMCaseExtractor.extract(text, record_id) → 调用 LLM → 解析 JSON → 校验
   4. validate_case_card(card, source_text) → 证据校验、合规检查
@@ -226,9 +226,66 @@ def _filter_non_clinical_lines(text: str) -> str:
     return "\n".join(filtered)
 
 
-def extract_llm_context(text: str, max_chars: int = 15000) -> str:
+def extract_llm_context(text: str, max_chars: int = 100000) -> str:
+    """
+    生成 LLM 病例卡抽取输入上下文。
+
+    当前策略已经从“强规则压缩”调整为“轻量清洗 + 长文本保留”：
+    1. 删除知情同意书、风险告知、授权委托、高值耗材、签名等非临床噪声
+    2. 保留入院、病程、查房、会诊、手术、检查、医嘱等临床主体文本
+    3. 仅在极端超长文本时做安全截断，避免单次请求过大
+
+    Args:
+        text: 原始病历全文
+        max_chars: 发送给 LLM 的最大字符数，默认按长上下文模型保守设置
+
+    Returns:
+        轻量清洗后的 LLM 输入文本
+    """
+    if not text:
+        return ""
+
+    cleaned = remove_non_clinical_consent_text(text)
+    cleaned = _normalize_llm_context_text(cleaned)
+
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    return _truncate_long_llm_context(cleaned, max_chars=max_chars)
+
+
+def _normalize_llm_context_text(text: str) -> str:
+    """清理多余空白，同时尽量不改变原始临床内容。"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.strip()
+
+
+def _truncate_long_llm_context(text: str, max_chars: int) -> str:
+    """
+    对极端长病历做安全截断。
+
+    长上下文模型可以承载更多原文，但少数病历可能包含大量重复医嘱/检验流水。
+    截断时保留首尾，并在中间插入说明，尽量保留入院信息和后期转归。
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    marker = "\n\n###系统截断提示:\n原始病历经过轻量清洗后仍超过 LLM 输入上限，中间部分已截断；请只根据可见文本抽取，不要补全不可见内容。\n\n"
+    if max_chars <= len(marker) + 2000:
+        return text[:max_chars]
+
+    head_chars = int((max_chars - len(marker)) * 0.7)
+    tail_chars = max_chars - len(marker) - head_chars
+    return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
+
+
+def extract_filtered_llm_context(text: str, max_chars: int = 15000) -> str:
     """
     从长病历中提取 LLM 输入上下文。
+
+    旧策略：强规则压缩。当前主流程不再使用，仅保留给历史对比或消融实验。
 
     策略：
     1. 优先提取关键章节全文
@@ -418,6 +475,7 @@ EXTRACTION_SYSTEM_PROMPT = """你是 ICU 临床病历信息抽取专家。请只
 6. 输出必须是严格的 JSON，不要包含 markdown 代码块标记（如 ```json），不要加任何解释性文字。直接输出 JSON 对象。
 7. 控制输出长度：primary_diagnoses 最多 5 项，secondary_diagnoses 最多 8 项，surgery_or_operations/key_interventions/organ_failures/complications 各最多 8 项，clinical_course 最多 6 个阶段。
 8. evidence 字段只引用最短可核验原文片段，单条 evidence 建议 20-80 字，不要粘贴整段病程。
+9. 所有字符串内容内部禁止使用英文双引号 "。如果原文含 "120"、"双J管"、药品后引号等内容，必须改写为中文引号 “120” 或直接去掉引号，避免破坏 JSON。
 
 ICU 病历常见模式提示：
 - 关键干预优先识别：机械通气（气管插管/呼吸机）、CRRT/血滤/透析、IABP/主动脉内球囊反搏、ECMO、升压药（去甲肾上腺素/多巴胺等）、PICCO监测
@@ -439,7 +497,7 @@ def build_case_card_prompt(context: str, record_id: str = "") -> str:
     构建 LLM case card 抽取的完整 prompt。
 
     Args:
-        context: 经过 extract_llm_context 压缩的病历文本
+        context: 经过 extract_llm_context 轻量清洗后的病历文本
         record_id: 病例 ID
 
     Returns:
@@ -500,7 +558,7 @@ class LLMCaseExtractor:
             return None
 
         # 1. 提取上下文
-        context = extract_llm_context(text)
+        context = extract_llm_context(text, max_chars=self.config.context_max_chars)
         if not context.strip():
             logger.warning(f"[{record_id}] LLM 上下文为空，跳过")
             return None
@@ -562,18 +620,29 @@ class LLMCaseExtractor:
                 with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
 
+                choices = body.get("choices")
+                if not choices:
+                    error_obj = body.get("error", body)
+                    error_text = json.dumps(error_obj, ensure_ascii=False)[:1000]
+                    raise RuntimeError(f"LLM API 返回缺少 choices: {error_text}")
+
                 usage = body.get("usage", {})
                 self._total_tokens += usage.get("total_tokens", 0)
                 self._request_count += 1
 
-                choice = body["choices"][0]
+                choice = choices[0]
+                message = choice.get("message") or {}
+                content = message.get("content")
+                if not content:
+                    finish_reason = choice.get("finish_reason")
+                    raise RuntimeError(f"LLM API 返回空 content: finish_reason={finish_reason}, choice={choice}")
+
                 self._last_response_meta = {
                     "finish_reason": choice.get("finish_reason"),
                     "prompt_tokens": usage.get("prompt_tokens"),
                     "completion_tokens": usage.get("completion_tokens"),
                     "total_tokens": usage.get("total_tokens"),
                 }
-                content = choice["message"]["content"]
                 return content.strip()
 
             except urllib.error.HTTPError as e:
@@ -631,6 +700,10 @@ class LLMCaseExtractor:
         # 4. 修复常见尾逗号
         candidates.extend(re.sub(r",\s*([}\]])", r"\1", c) for c in list(candidates))
 
+        # 5. 修复字符串内部未转义英文双引号（如 evidence 中的 "120"）
+        # 这类错误很常见：模型整体输出完整 JSON，但原文证据片段含裸引号。
+        candidates.extend(self._repair_unescaped_quotes_in_json_strings(c) for c in list(candidates))
+
         seen = set()
         for candidate in candidates:
             if not candidate or candidate in seen:
@@ -645,6 +718,62 @@ class LLMCaseExtractor:
             self._log_json_parse_failure(raw, record_id, stage="parse")
         return None
 
+    @staticmethod
+    def _repair_unescaped_quotes_in_json_strings(text: str) -> str:
+        """
+        修复 JSON 字符串内部的裸英文双引号。
+
+        LLM 常把原文 evidence 写成：
+            "evidence": "急拨打"120"至..."
+        标准 json.loads 会失败。这里按 JSON 词法做轻量扫描：
+        - 在字符串内部遇到未转义 " 时，只有后续第一个非空白字符是
+          :, ,, ], } 或文本结束，才认为它是字符串结束符；
+        - 否则认为它是字符串内容的一部分，转义为 \"。
+
+        这个修复只处理语法，不改医学内容。
+        """
+        if not text:
+            return text
+
+        result = []
+        in_string = False
+        escaped = False
+        n = len(text)
+
+        for i, ch in enumerate(text):
+            if not in_string:
+                result.append(ch)
+                if ch == '"':
+                    in_string = True
+                    escaped = False
+                continue
+
+            if escaped:
+                result.append(ch)
+                escaped = False
+                continue
+
+            if ch == "\\":
+                result.append(ch)
+                escaped = True
+                continue
+
+            if ch == '"':
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                next_ch = text[j] if j < n else ""
+                if next_ch in {":", ",", "]", "}"} or j >= n:
+                    result.append(ch)
+                    in_string = False
+                else:
+                    result.append('\\"')
+                continue
+
+            result.append(ch)
+
+        return "".join(result)
+
     def _repair_json_response(self, raw: str, record_id: str) -> str:
         """让 LLM 只修复 JSON 格式，不重新抽取医学信息。"""
         if not raw:
@@ -653,7 +782,8 @@ class LLMCaseExtractor:
         repair_system_prompt = (
             "你是严格 JSON 修复器。用户会提供一个本应为 JSON 对象的文本。"
             "你只能修复 JSON 语法问题，必须保留原始字段和值，不要补充医学信息，"
-            "不要解释，不要输出 markdown，只输出一个完整合法的 JSON 对象。"
+            "尤其要修复字符串内部未转义的英文双引号，例如把 \"120\" 变成 \\\"120\\\" "
+            "或中文引号 “120”。不要解释，不要输出 markdown，只输出一个完整合法的 JSON 对象。"
         )
         repair_prompt = (
             "下面的文本 json.loads 失败。请只修复格式问题，输出完整合法 JSON 对象。\n\n"

@@ -114,8 +114,9 @@ class LLMConfig:
     model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "gpt-4o-mini"))
     max_tokens: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS", "4096")))
     temperature: float = 0.0
-    timeout: int = field(default_factory=lambda: int(os.environ.get("LLM_TIMEOUT", "120")))
+    timeout: int = field(default_factory=lambda: int(os.environ.get("LLM_TIMEOUT", "300")))
     max_retries: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_RETRIES", "3")))
+    context_max_chars: int = field(default_factory=lambda: int(os.environ.get("LLM_CONTEXT_MAX_CHARS", "100000")))
     enable_json_repair: bool = field(default_factory=lambda: os.environ.get("LLM_ENABLE_JSON_REPAIR", "1") != "0")
     save_failed_raw: bool = field(default_factory=lambda: os.environ.get("LLM_SAVE_FAILED_RAW", "1") != "0")
     failed_raw_dir: str = field(default_factory=lambda: os.environ.get("LLM_FAILED_RAW_DIR", "data/llm_failures"))
