@@ -1,11 +1,9 @@
 """
 病历相似度检索系统 - 主程序入口
 
-两种模式:
-- build:  从 MySQL medical_records 原始表解析全量病历，提取特征向量，存入 record_vectors 表
-          可选 --with-llm 启用 LLM 病例卡抽取 + embedding
-- search: 从 MySQL record_vectors 表加载预计算向量，检索相似病例
-          自动检测病例卡数据，启用 LLM 增强融合
+两个入口:
+- --build:  从 MySQL medical_records 原始表解析病历，增量构建患者级和天级索引
+- --search: 从 Excel 导入本次查询病例，加载预计算索引并检索相似病例
 """
 
 import os
@@ -617,7 +615,7 @@ def search(search_excel: str = "",
     print(f"底库病例总数: {len(system.record_order)}")
 
     if not system.record_order:
-        print("底库为空，请先运行: python main.py --mode build")
+        print("底库为空，请先运行: python main.py --build")
         return
 
     if search_excel:
@@ -906,10 +904,11 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='病历相似度检索系统')
-    parser.add_argument('--mode', choices=['build', 'search'], default='search',
-                        help='build: 从原始病历构建向量索引入库 (强制含 LLM+Embedding); search: 检索相似病例（默认）')
+    parser.add_argument('--build', action='store_true', default=False,
+                        help='构建/增量更新底库索引')
     parser.add_argument('--search', default='',
-                        help='查询 Excel 路径；指定后每次检索前清空 query_records，并导入该 Excel 作为本次查询病例')
+                        metavar='EXCEL',
+                        help='查询 Excel 路径；每次检索前清空 query_records，并导入该 Excel 作为本次查询病例')
     parser.add_argument('--workers', '-j', type=int, default=1,
                         help='build 时并行进程数（默认1，设为0则自动使用全部CPU核心）')
     parser.add_argument('--skip-existing-case-cards', action='store_true', default=False,
@@ -939,7 +938,18 @@ def main():
     print("╚" + "═" * 58 + "╝")
     print()
 
-    if args.mode == 'build':
+    if args.build and args.search:
+        parser.error("--build 和 --search 不能同时使用")
+
+    action = None
+    if args.build:
+        action = "build"
+    elif args.search:
+        action = "search"
+    else:
+        parser.error("请指定 --build 或 --search EXCEL")
+
+    if action == 'build':
         build_index(
             num_workers=num_workers,
             skip_existing=True,

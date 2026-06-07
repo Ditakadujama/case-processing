@@ -79,19 +79,19 @@ python migrate_xlsx_to_mysql.py --xlsx "patient_info (18).xlsx"
 
 ```bash
 # 8 进程并行增量构建（默认：只处理新病例或缺索引的病例）
-python main.py --mode build --workers 8
+python main.py --build --workers 8
 
 # 清空患者级和天级索引后全量重建
-python main.py --mode build --workers 8 --rebuild-all
+python main.py --build --workers 8 --rebuild-all
 
 # 调试模式：只处理 10 条记录，不清空现有数据库
-python main.py --mode build --workers 1 --limit 10
+python main.py --build --workers 1 --limit 10
 
 # 跳过已有相同版本的病例卡记录
-python main.py --mode build --workers 8 --skip-existing-case-cards
+python main.py --build --workers 8 --skip-existing-case-cards
 
 # 调整 LLM 并行线程数（IO 密集型，可适当增大）
-python main.py --mode build --workers 8 --llm-workers 10
+python main.py --build --workers 8 --llm-workers 10
 ```
 
 **Build 模式流程：**
@@ -119,13 +119,9 @@ python main.py --search "query_cases.xlsx" --daily-days 7
 # 调整窗口病程权重（0~1，默认 0.55）
 python main.py --search "query_cases.xlsx" --timeline-days 7 --timeline-window-weight 0.6
 
-# 兼容旧入口：不指定 --search 时读取 ./data/records/*.txt
-python main.py --mode search
 ```
 
 **查询 Excel**：格式与迁移 Excel 一致，至少包含 `patient_id` 和 `visit_date`（或 `date`）列。指定 `--search` 后，程序会在每次检索前清空 `query_records` 表，再导入本次 Excel；检索时按 `patient_id + visit_date` 合并为患者病程，并继续走天级比较逻辑。
-
-**兼容查询文件**：不传 `--search` 时，仍可将待查询的病历文本（`.txt` 文件）放入 `./data/records/` 目录。
 
 **检索结果**：每个查询文件的结果写入 `./data/results/{文件名}_结果.txt`，包含：
 - 综合相似度、各维度分项得分
@@ -139,7 +135,7 @@ python main.py --mode search
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--mode` | 运行模式：`build` 或 `search` | `search` |
+| `--build` | 构建/增量更新底库索引 | `False` |
 | `--search` | 查询 Excel 路径；每次检索前清空 `query_records` 并导入该 Excel | 空 |
 | `--workers`, `-j` | Build 时并行进程数（0=自动） | `1` |
 | `--limit` | Build 限制处理条数（0=不限制，调试用） | `0` |
@@ -290,14 +286,14 @@ Day Similarity =
 ## 常见问题
 
 **Q: 检索时提示"底库为空"？**
-先运行 `python main.py --mode build` 构建向量索引。
+先运行 `python main.py --build` 构建向量索引。
 
 **Q: Build 模式报 LLM 服务未配置？**
 `.env` 中检查 `LLM_API_BASE` 和 `LLM_API_KEY` 是否正确设置。Build 模式强制需要 LLM + Embedding。
 
 **Q: 如何只测试几条数据？**
 ```bash
-python main.py --mode build --workers 1 --limit 5
+python main.py --build --workers 1 --limit 5
 ```
 `--limit` 模式不会清空现有数据库。
 
