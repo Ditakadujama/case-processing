@@ -1,6 +1,6 @@
 # 病历相似度检索系统
 
-将病历文本转换为 105 维特征向量，通过**两阶段检索**（向量粗排 + 病程精排）查找相似病例。支持 **LLM 病例卡抽取 + Embedding 语义增强**，实现四路融合检索。
+将病历文本转换为结构化向量、时间轴特征和 LLM 病例卡，通过**两阶段检索**（向量粗排 + 病程精排）查找相似病例。当前版本新增**天级索引**：把每个患者拆成 Day 1 / Day 2 / Day 3...，为每天建立结构化向量、时间轴特征、每日病例卡和 embedding，再逐日对齐聚合为患者相似度。
 
 ## 环境准备
 
@@ -78,8 +78,11 @@ python migrate_xlsx_to_mysql.py --xlsx "patient_info (18).xlsx"
 从 MySQL 原始病历数据批量解析，提取特征向量，存入 `record_vectors` 表。**强制包含 LLM 病例卡抽取 + Embedding**。
 
 ```bash
-# 8 进程并行构建
+# 8 进程并行增量构建（默认：只处理新病例或缺索引的病例）
 python main.py --mode build --workers 8
+
+# 清空患者级和天级索引后全量重建
+python main.py --mode build --workers 8 --rebuild-all
 
 # 调试模式：只处理 10 条记录，不清空现有数据库
 python main.py --mode build --workers 1 --limit 10
@@ -93,29 +96,40 @@ python main.py --mode build --workers 8 --llm-workers 10
 
 **Build 模式流程：**
 1. 从 `medical_records` 表读取全部患者文本
-2. 清空 `record_vectors` 和 `record_case_cards` 表（调试模式 `--limit` 除外）
-3. 分批处理（每批 200 条）：多进程解析 → 特征提取 → 时间轴计算 → MySQL 写入
-4. 每批入库后执行 LLM 病例卡抽取 + Embedding 生成
+2. 默认增量处理：患者级向量、患者级病例卡、天级硬特征、天级病例卡都存在时跳过
+3. 只有显式传入 `--rebuild-all` 时，才清空 `record_vectors`、`record_case_cards`、`record_days`、`record_day_case_cards`
+4. 分批处理（每批 200 条）：多进程解析 → 特征提取 → 时间轴计算 → MySQL 写入
+5. 每批入库后执行患者级 LLM 病例卡抽取 + Embedding 生成
+6. 同步生成天级索引：`record_days` + `record_day_case_cards`
 
 ### 检索相似病例（Search 模式，默认）
 
 从 MySQL 加载预计算向量，对查询病例进行相似度检索。
 
 ```bash
-# 基本检索
-python main.py --mode search
+# 推荐：从 Excel 导入本次查询病例并检索
+python main.py --search "query_cases.xlsx"
 
-# 启用病程窗口比较（入院后前 7 天 + 完整住院病程）
-python main.py --mode search --timeline-days 7
+# 启用入院后前 7 天比较；如果存在天级索引，会额外启用逐日精排
+python main.py --search "query_cases.xlsx" --timeline-days 7
+
+# 只做前 7 天的天级比较；默认不传时按查询病例全部已有天数比较
+python main.py --search "query_cases.xlsx" --daily-days 7
 
 # 调整窗口病程权重（0~1，默认 0.55）
-python main.py --mode search --timeline-days 7 --timeline-window-weight 0.6
+python main.py --search "query_cases.xlsx" --timeline-days 7 --timeline-window-weight 0.6
+
+# 兼容旧入口：不指定 --search 时读取 ./data/records/*.txt
+python main.py --mode search
 ```
 
-**查询文件**：将待查询的病历文本（`.txt` 文件）放入 `./data/records/` 目录。
+**查询 Excel**：格式与迁移 Excel 一致，至少包含 `patient_id` 和 `visit_date`（或 `date`）列。指定 `--search` 后，程序会在每次检索前清空 `query_records` 表，再导入本次 Excel；检索时按 `patient_id + visit_date` 合并为患者病程，并继续走天级比较逻辑。
+
+**兼容查询文件**：不传 `--search` 时，仍可将待查询的病历文本（`.txt` 文件）放入 `./data/records/` 目录。
 
 **检索结果**：每个查询文件的结果写入 `./data/results/{文件名}_结果.txt`，包含：
 - 综合相似度、各维度分项得分
+- 天级患者相似度、轨迹相似度、每日对齐明细、覆盖度和候选/查询天数
 - 排序置信度（Top-1/Top-2 分差）
 - 临床主题冲突检测
 - 相似原因分析（共同诊断、共同干预、共同器官问题等）
@@ -126,12 +140,37 @@ python main.py --mode search --timeline-days 7 --timeline-window-weight 0.6
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--mode` | 运行模式：`build` 或 `search` | `search` |
+| `--search` | 查询 Excel 路径；每次检索前清空 `query_records` 并导入该 Excel | 空 |
 | `--workers`, `-j` | Build 时并行进程数（0=自动） | `1` |
 | `--limit` | Build 限制处理条数（0=不限制，调试用） | `0` |
-| `--skip-existing-case-cards` | Build 跳过已有病例卡 | `False` |
+| `--skip-existing-case-cards` | 兼容旧参数；当前 Build 默认已按患者级 + 天级索引增量跳过 | `False` |
+| `--rebuild-all` | Build 时清空患者级和天级索引后全量重建；不传则默认增量 | `False` |
 | `--llm-workers` | LLM 抽取并行线程数 | `5` |
 | `--timeline-days` | Search 病程窗口天数（0=完整病程） | `0` |
 | `--timeline-window-weight` | Search 窗口病程权重（0~1） | `0.55` |
+| `--daily-days` | 天级比较天数：`0`=按查询病例全部已有天数比较；N>0=只比较前 N 天 | `0` |
+
+### 天级索引
+
+Build 模式会额外创建并维护两张天级表：
+
+| 表 | 内容 |
+|------|------|
+| `record_days` | `patient_id + day_index` 的当天文本、累计文本、每日结构化向量、累计结构化向量、每日时间轴特征 |
+| `record_day_case_cards` | 每日 LLM 病例卡、当天变化 embedding、截至当天累计状态 embedding |
+
+检索时仍返回患者级 Top-K。系统先用现有患者级向量/embedding 召回候选，再对候选执行天级精排：
+
+```text
+Day Similarity =
+  day_delta_embedding
+  + cumulative_embedding
+  + day_case_card_tag
+  + day_timeline_features
+  + day_structured_vector
+```
+
+同一天优先严格对齐，同时允许 `Day N` 与候选 `Day N-1 / Day N / Day N+1` 轻微错位匹配。默认按查询病例已有全部天数比较；候选病例天数可以不同，候选短于查询时会根据实际匹配天数做覆盖度修正。天级分会作为精排增强纳入患者最终分，现有患者级整体比较保留为兜底。
 
 ## 检索原理
 

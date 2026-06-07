@@ -53,8 +53,24 @@ def get_db_connection(cfg: DBConfig):
             conn.close()
 
 
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS medical_records (
+RECORD_COLUMNS = [
+    "patient_info",
+    "chief_complaint",
+    "instrument_test",
+    "checkout",
+    "examine",
+    "doctor_advice",
+    "inspection_visit",
+    "history_illness",
+    "surgery_record",
+    "monitor",
+    "operation_record",
+]
+
+
+def _create_records_table_sql(table_name: str, comment: str) -> str:
+    return f"""
+CREATE TABLE IF NOT EXISTS `{table_name}` (
     id INT AUTO_INCREMENT PRIMARY KEY,
     patient_id VARCHAR(64) NOT NULL COMMENT '患者唯一标识',
     visit_date DATE NOT NULL COMMENT '就诊日期',
@@ -72,8 +88,14 @@ CREATE TABLE IF NOT EXISTS medical_records (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_patient_id (patient_id),
     INDEX idx_visit_date (visit_date)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='病历原始记录表';
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='{comment}';
 """
+
+
+CREATE_TABLE_SQL = _create_records_table_sql("medical_records", "病历原始记录表")
+
+
+CREATE_QUERY_TABLE_SQL = _create_records_table_sql("query_records", "检索病例临时表")
 
 
 def init_database(cfg: DBConfig) -> None:
@@ -85,9 +107,28 @@ def init_database(cfg: DBConfig) -> None:
         logger.info(f"数据库表 medical_records 已就绪 (database={cfg.database})")
 
 
-def load_records_from_db(cfg: DBConfig) -> Dict[str, str]:
+def init_query_records_table(cfg: DBConfig) -> None:
+    """初始化检索病例临时表。"""
+    with get_db_connection(cfg) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(CREATE_QUERY_TABLE_SQL)
+        conn.commit()
+        logger.info(f"数据库表 query_records 已就绪 (database={cfg.database})")
+
+
+def clear_query_records(cfg: DBConfig) -> None:
+    """清空检索病例临时表。"""
+    init_query_records_table(cfg)
+    with get_db_connection(cfg) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM query_records")
+        conn.commit()
+        logger.info("已清空 query_records")
+
+
+def load_records_from_table(cfg: DBConfig, table_name: str) -> Dict[str, str]:
     """
-    从数据库读取病历数据，按 patient_id 分组合并。
+    从指定病历表读取数据，按 patient_id 分组合并。
 
     合并格式与 load_xlsx_records() 完全一致：
       - 按 patient_id 分组
@@ -104,25 +145,15 @@ def load_records_from_db(cfg: DBConfig) -> Dict[str, str]:
     Returns:
         {patient_id: 合并后的病历文本}
     """
-    columns_to_merge = [
-        "patient_info",
-        "chief_complaint",
-        "instrument_test",
-        "checkout",
-        "examine",
-        "doctor_advice",
-        "inspection_visit",
-        "history_illness",
-        "surgery_record",
-        "monitor",
-        "operation_record",
-    ]
+    allowed_tables = {"medical_records", "query_records"}
+    if table_name not in allowed_tables:
+        raise ValueError(f"不支持读取表: {table_name}")
 
     sql = """
         SELECT patient_id, visit_date, {}
-        FROM medical_records
+        FROM `{}`
         ORDER BY patient_id, visit_date
-    """.format(", ".join(f"`{c}`" for c in columns_to_merge))
+    """.format(", ".join(f"`{c}`" for c in RECORD_COLUMNS), table_name)
 
     records: Dict[str, List[str]] = {}
     patient_order: List[str] = []
@@ -141,7 +172,7 @@ def load_records_from_db(cfg: DBConfig) -> Dict[str, str]:
         date_str = str(row["visit_date"]) if row["visit_date"] else ""
         parts = [f"###就诊记录 - {date_str}"]
 
-        for col in columns_to_merge:
+        for col in RECORD_COLUMNS:
             val = row.get(col)
             if val is not None and str(val).strip():
                 parts.append(f"###{col}: {val}")
@@ -163,33 +194,44 @@ def load_records_from_db(cfg: DBConfig) -> Dict[str, str]:
             final_parts.append("\n".join(lines))
         merged[pid] = "\n\n".join(final_parts)
 
-    logger.info(f"从数据库读取到 {len(merged)} 个患者，共 {len(rows)} 条就诊记录")
+    logger.info(f"从 {table_name} 读取到 {len(merged)} 个患者，共 {len(rows)} 条就诊记录")
     return merged
 
 
-def insert_records(cfg: DBConfig, records_df: Any) -> int:
+def load_records_from_db(cfg: DBConfig) -> Dict[str, str]:
+    """从 medical_records 读取底库病历并按 patient_id 合并。"""
+    return load_records_from_table(cfg, "medical_records")
+
+
+def load_query_records_from_db(cfg: DBConfig) -> Dict[str, str]:
+    """从 query_records 读取检索病历并按 patient_id 合并。"""
+    init_query_records_table(cfg)
+    return load_records_from_table(cfg, "query_records")
+
+
+def insert_records(cfg: DBConfig, records_df: Any, table_name: str = "medical_records") -> int:
     """
-    将 pandas DataFrame 批量写入 medical_records 表。
+    将 pandas DataFrame 批量写入病历表。
 
     Args:
         cfg: 数据库配置
         records_df: pandas DataFrame，列名需与表字段对应
+        table_name: 写入表，支持 medical_records/query_records
 
     Returns:
         插入的行数
     """
     import pandas as pd
 
+    allowed_tables = {"medical_records", "query_records"}
+    if table_name not in allowed_tables:
+        raise ValueError(f"不支持写入表: {table_name}")
+
     if records_df.empty:
         return 0
 
     # 确保列名存在
-    db_columns = [
-        "patient_id", "visit_date", "patient_info", "chief_complaint",
-        "instrument_test", "checkout", "examine", "doctor_advice",
-        "inspection_visit", "history_illness", "surgery_record",
-        "monitor", "operation_record",
-    ]
+    db_columns = ["patient_id", "visit_date"] + RECORD_COLUMNS
 
     available_cols = [c for c in db_columns if c in records_df.columns]
     if not available_cols:
@@ -198,7 +240,7 @@ def insert_records(cfg: DBConfig, records_df: Any) -> int:
     # 构建 INSERT SQL
     cols_str = ", ".join(f"`{c}`" for c in available_cols)
     placeholders = ", ".join(["%s"] * len(available_cols))
-    sql = f"INSERT INTO medical_records ({cols_str}) VALUES ({placeholders})"
+    sql = f"INSERT INTO `{table_name}` ({cols_str}) VALUES ({placeholders})"
 
     rows_inserted = 0
     batch_size = 500
@@ -228,7 +270,7 @@ def insert_records(cfg: DBConfig, records_df: Any) -> int:
 
         conn.commit()
 
-    logger.info(f"成功写入 {rows_inserted} 条记录到数据库")
+    logger.info(f"成功写入 {rows_inserted} 条记录到 {table_name}")
     return rows_inserted
 
 

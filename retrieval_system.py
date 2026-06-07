@@ -26,6 +26,8 @@ from case_card import (
     has_real_tag_overlap,
 )
 from embedding_index import EmbeddingService, cosine_similarity, batch_cosine_similarity
+from day_record_builder import DayRecordBuilder
+from day_store import MySQLDayStore, DEFAULT_DAY_EXTRACTOR_VERSION
 
 
 SUMMARY_SECTIONS = (
@@ -118,6 +120,50 @@ def _counter_cosine(a: Counter, b: Counter) -> float:
     return float(dot / (norm_a * norm_b))
 
 
+def _vector_cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    if a.size == 0 or b.size == 0 or a.shape != b.shape:
+        return None
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return None
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def _day_card_tags(card: Optional[dict]) -> set:
+    """从每日病例卡抽取轻量标签集合。"""
+    if not card:
+        return set()
+    tags = set()
+    for key in (
+        "baseline_context", "new_diagnoses", "new_interventions",
+        "operations", "organ_status", "complications",
+    ):
+        values = card.get(key) or []
+        for value in values:
+            if isinstance(value, str):
+                tags.add(value.strip())
+            elif isinstance(value, dict):
+                for sub_key in ("name", "label", "type", "status"):
+                    sub_val = value.get(sub_key)
+                    if sub_val:
+                        tags.add(str(sub_val).strip())
+    state = card.get("clinical_state")
+    if state:
+        tags.add(f"state:{state}")
+    return {t for t in tags if t}
+
+
+def _jaccard(a: set, b: set) -> Optional[float]:
+    if not a and not b:
+        return None
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 class MedicalRecordSimilaritySystem:
     """
     病历相似度检索系统
@@ -175,14 +221,18 @@ class MedicalRecordSimilaritySystem:
 
         # LLM 增强模块（懒初始化）
         self._case_card_store = None
+        self._day_store: Optional[MySQLDayStore] = None
         self._embedding_service: Optional[EmbeddingService] = None
         self._case_card_cache: Dict[str, dict] = {}
         self._embedding_cache: Optional[np.ndarray] = None  # (N, D) float32
         self._embedding_ids: List[str] = []  # 与 _embedding_cache 行对齐
         self._embedding_id_to_idx: Dict[str, int] = {}  # record_id → embedding 行索引
+        self._day_records_by_patient: Dict[str, List[dict]] = {}
+        self._day_cards_by_patient: Dict[str, List[dict]] = {}
 
         # LLM 抽取器（搜索时实时抽取查询病例卡）
         self._llm_extractor = None
+        self._day_record_builder = DayRecordBuilder()
 
         # TF-IDF 向量器是否已训练
         self._extractor_fitted = False
@@ -214,6 +264,15 @@ class MedicalRecordSimilaritySystem:
             self._case_card_store = MySQLCaseCardStore(self._db_config)
             self._case_card_store.init_table()
         return self._case_card_store
+
+    def _get_day_store(self) -> MySQLDayStore:
+        """懒初始化 MySQLDayStore"""
+        if self._day_store is None:
+            if self._db_config is None:
+                self._db_config = DBConfig.from_env()
+            self._day_store = MySQLDayStore(self._db_config)
+            self._day_store.init_tables()
+        return self._day_store
 
     def _get_embedding_service(self) -> Optional[EmbeddingService]:
         """懒初始化 EmbeddingService"""
@@ -390,7 +449,8 @@ class MedicalRecordSimilaritySystem:
                record_id: Optional[str] = None,
                exclude_record_ids: Optional[set] = None,
                timeline_days: int = 0,
-               timeline_window_weight: float = 0.55) -> List[Dict]:
+               timeline_window_weight: float = 0.55,
+               daily_days: int = 0) -> List[Dict]:
         """
         检索相似病例
 
@@ -402,6 +462,7 @@ class MedicalRecordSimilaritySystem:
             exclude_record_ids: 需要排除的病例ID集合（如查询病例自身）
             timeline_days: 病程窗口天数；0=完整住院病程；N>0=额外比较入院后前N天
             timeline_window_weight: 窗口病程分在混合病程分中的权重（0~1，默认0.55）
+            daily_days: 天级比较天数；0=使用查询病例全部天数
 
         Returns:
             [{'id': xxx, 'similarity': 0.85, 'text': xxx}, ...]
@@ -410,19 +471,24 @@ class MedicalRecordSimilaritySystem:
             raise ValueError("timeline_days 不能小于 0")
         if not 0.0 <= timeline_window_weight <= 1.0:
             raise ValueError("timeline_window_weight 必须在 0~1 之间")
+        if daily_days < 0:
+            raise ValueError("daily_days 不能小于 0")
 
         if auto_add:
             return self.search_and_add(query_text, record_id, top_k, exclude_record_ids,
-                                       timeline_days, timeline_window_weight)
+                                       timeline_days, timeline_window_weight,
+                                       daily_days=daily_days)
 
         results, _, _, _ = self._search_only(query_text, top_k, exclude_record_ids,
-                                              timeline_days, timeline_window_weight)
+                                              timeline_days, timeline_window_weight,
+                                              daily_days=daily_days)
         return results
 
     def _search_only(self, query_text: str, top_k: int,
                      exclude_record_ids: Optional[set] = None,
                      timeline_days: int = 0,
-                     timeline_window_weight: float = 0.55) -> Tuple[List[Dict], MedicalRecord, np.ndarray, object]:
+                     timeline_window_weight: float = 0.55,
+                     daily_days: int = 0) -> Tuple[List[Dict], MedicalRecord, np.ndarray, object]:
         """仅检索，不入库。返回 (results, parsed_record, features, timeline_features) 供 search_and_add 复用"""
         if not self.record_order:
             return [], None, None, None
@@ -493,6 +559,17 @@ class MedicalRecordSimilaritySystem:
         # 系统级开关：是否启用了标签/embedding 增强（用于结果展示判断）
         use_embedding = has_embeddings and query_embedding is not None
         use_tag = has_case_cards and query_card is not None
+
+        day_level_enabled = bool(self._day_records_by_patient)
+        daily_limit = daily_days
+        query_day_items: List[dict] = []
+        if day_level_enabled:
+            query_day_items = self._build_query_day_items(
+                query_text,
+                patient_id="__query__",
+                max_days=daily_limit,
+                enable_day_llm=self.enable_llm and bool(self._day_cards_by_patient),
+            )
 
         # ── 第一阶段：多路候选召回 ──
         # 1. 结构化向量候选
@@ -650,6 +727,20 @@ class MedicalRecordSimilaritySystem:
                     0.25 * text_sim
                 )
 
+            daily_patient_sim = None
+            daily_match_details = []
+            trajectory_sim = None
+            daily_stats = {}
+            if query_day_items and record_id in self._day_records_by_patient:
+                daily_patient_sim, daily_match_details, trajectory_sim, daily_stats = self._daily_patient_similarity(
+                    query_day_items,
+                    record_id,
+                    max_days=daily_limit,
+                )
+                if daily_patient_sim is not None:
+                    # 第一版作为精排增强：天级病程占 30%，患者级融合保留 70% 兜底。
+                    base_sim = 0.70 * base_sim + 0.30 * daily_patient_sim
+
             if timeline_sim < self.min_timeline_score:
                 base_sim *= 0.5
 
@@ -700,6 +791,17 @@ class MedicalRecordSimilaritySystem:
                     'timeline_window_days': timeline_days,
                     'timeline_window_weight': timeline_window_weight if timeline_days > 0 else 0.0,
                 }
+                if daily_patient_sim is not None:
+                    result['daily_patient_similarity'] = round(daily_patient_sim, 4)
+                    result['daily_match_details'] = daily_match_details
+                    result['trajectory_similarity'] = round(trajectory_sim, 4) if trajectory_sim is not None else '-'
+                    result['daily_compare_days'] = daily_stats.get("query_compare_days", 0)
+                    result['daily_query_days'] = daily_stats.get("query_days", 0)
+                    result['daily_candidate_days'] = daily_stats.get("candidate_days", 0)
+                    result['daily_matched_days'] = daily_stats.get("matched_days", 0)
+                    result['daily_coverage'] = round(daily_stats.get("coverage", 0.0), 4)
+                    result['daily_length_relation'] = daily_stats.get("length_relation", "")
+                    result['daily_coverage_factor'] = round(daily_stats.get("coverage_factor", 1.0), 4)
                 if timeline_window_fallback:
                     result['timeline_window_fallback'] = True
 
@@ -739,14 +841,16 @@ class MedicalRecordSimilaritySystem:
                        top_k: int = 10,
                        exclude_record_ids: Optional[set] = None,
                        timeline_days: int = 0,
-                       timeline_window_weight: float = 0.55) -> List[Dict]:
+                       timeline_window_weight: float = 0.55,
+                       daily_days: int = 0) -> List[Dict]:
         """
         检索相似病例 + 自动入库（复用 _search_only 的解析结果，避免重复 parse）
         """
         # 1. 检索（保留中间解析结果）
         results, query_record, query_features, query_timeline_features = \
             self._search_only(query_text, top_k, exclude_record_ids,
-                            timeline_days, timeline_window_weight)
+                              timeline_days, timeline_window_weight,
+                              daily_days=daily_days)
 
         # 2. 自动入库（复用解析结果，避免重复 parse/extract/timeline）
         if record_id is None:
@@ -839,6 +943,235 @@ class MedicalRecordSimilaritySystem:
         self._timeline_window_feature_cache[cache_key] = features
         return features
 
+    def _build_query_day_items(self, query_text: str, patient_id: str,
+                               max_days: int,
+                               enable_day_llm: bool) -> List[dict]:
+        """构造查询病例天级特征。"""
+        day_records = self._day_record_builder.build(patient_id, query_text, max_days=max_days)
+        items = []
+        extractor = self._get_llm_extractor() if enable_day_llm else None
+        emb_service = self._get_embedding_service() if enable_day_llm else None
+
+        for day in day_records:
+            day_parsed = self.parser.parse(day.day_text)
+            cumulative_parsed = self.parser.parse(day.cumulative_text)
+            day_vector = self.extractor.extract(day_parsed)
+            cumulative_vector = self.extractor.extract(cumulative_parsed)
+            nodes = self.timeline_parser.generate_standard_nodes(day.timeline_events)
+            timeline_features = self.timeline_scorer.extract_features(
+                day.timeline_events,
+                nodes,
+                surgery_type_hint=day_parsed.surgery_type or None,
+                surgery_keywords_hint=day_parsed.surgery_keywords or None,
+            )
+
+            card = None
+            day_embedding = None
+            cumulative_embedding = None
+            if extractor and extractor.is_available:
+                try:
+                    card = extractor.extract_day(
+                        day.day_text,
+                        day.cumulative_text,
+                        patient_id=patient_id,
+                        day_index=day.day_index,
+                        visit_date=day.visit_date,
+                    )
+                except Exception as e:
+                    print(f"  查询 Day {day.day_index} 病例卡抽取失败: {e}")
+                    card = None
+
+            if card and emb_service and emb_service.is_available:
+                try:
+                    day_summary = card.get("day_summary_for_embedding") or card.get("summary_for_embedding", "")
+                    cumulative_summary = card.get("cumulative_summary_for_embedding") or card.get("summary_for_embedding", "")
+                    if day_summary:
+                        day_embedding = emb_service.embed_text(day_summary).astype(np.float64)
+                        norm = np.linalg.norm(day_embedding)
+                        if norm > 0:
+                            day_embedding = day_embedding / norm
+                    if cumulative_summary:
+                        cumulative_embedding = emb_service.embed_text(cumulative_summary).astype(np.float64)
+                        norm = np.linalg.norm(cumulative_embedding)
+                        if norm > 0:
+                            cumulative_embedding = cumulative_embedding / norm
+                except Exception as e:
+                    print(f"  查询 Day {day.day_index} embedding 生成失败: {e}")
+
+            items.append({
+                "day_index": day.day_index,
+                "day_feature_vector": day_vector,
+                "cumulative_feature_vector": cumulative_vector,
+                "day_timeline_features": timeline_features,
+                "case_card": card,
+                "day_delta_embedding": day_embedding,
+                "cumulative_embedding": cumulative_embedding,
+                "trajectory_state": (card or {}).get("clinical_state", ""),
+            })
+
+        return items
+
+    def _candidate_day_items(self, patient_id: str) -> List[dict]:
+        """合并候选患者的天级硬特征和病例卡。"""
+        day_records = self._day_records_by_patient.get(patient_id) or []
+        day_cards = {
+            item["day_record_id"]: item
+            for item in self._day_cards_by_patient.get(patient_id, [])
+        }
+        result = []
+        for item in day_records:
+            merged = dict(item)
+            card_item = day_cards.get(item["day_record_id"])
+            if card_item:
+                merged.update(card_item)
+                merged["trajectory_state"] = (
+                    (card_item.get("case_card") or {}).get("clinical_state")
+                    or merged.get("trajectory_state", "")
+                )
+            result.append(merged)
+        return result
+
+    def _day_pair_similarity(self, query_day: dict, cand_day: dict) -> Optional[float]:
+        """计算两个天级单元的相似度，缺失信号自动重归一化。"""
+        parts = []
+
+        day_emb = _vector_cosine(query_day.get("day_delta_embedding"), cand_day.get("day_delta_embedding"))
+        if day_emb is not None:
+            parts.append((0.30, max(0.0, day_emb)))
+
+        cumulative_emb = _vector_cosine(query_day.get("cumulative_embedding"), cand_day.get("cumulative_embedding"))
+        if cumulative_emb is not None:
+            parts.append((0.20, max(0.0, cumulative_emb)))
+
+        q_tags = _day_card_tags(query_day.get("case_card"))
+        c_tags = _day_card_tags(cand_day.get("case_card"))
+        tag_sim = _jaccard(q_tags, c_tags)
+        if tag_sim is not None:
+            parts.append((0.15, tag_sim))
+
+        q_timeline = query_day.get("day_timeline_features")
+        c_timeline = cand_day.get("day_timeline_features")
+        if q_timeline is not None and c_timeline is not None:
+            parts.append((0.15, self.timeline_scorer.score(q_timeline, c_timeline)))
+
+        day_vec = _vector_cosine(query_day.get("day_feature_vector"), cand_day.get("day_feature_vector"))
+        if day_vec is not None:
+            parts.append((0.10, max(0.0, day_vec)))
+
+        cumulative_vec = _vector_cosine(
+            query_day.get("cumulative_feature_vector"),
+            cand_day.get("cumulative_feature_vector"),
+        )
+        if cumulative_vec is not None:
+            parts.append((0.05, max(0.0, cumulative_vec)))
+
+        state_sim = 1.0 if (
+            query_day.get("trajectory_state")
+            and query_day.get("trajectory_state") == cand_day.get("trajectory_state")
+        ) else None
+        if state_sim is not None:
+            parts.append((0.05, state_sim))
+
+        if not parts:
+            return None
+        total_weight = sum(weight for weight, _ in parts)
+        return float(sum(weight * score for weight, score in parts) / total_weight)
+
+    def _daily_patient_similarity(self, query_days: List[dict], patient_id: str,
+                                  max_days: int) -> Tuple[Optional[float], List[dict], Optional[float], dict]:
+        """逐日软对齐后聚合成患者天级分。"""
+        candidate_days = self._candidate_day_items(patient_id)
+        stats = {
+            "query_days": len(query_days),
+            "candidate_days": len(candidate_days),
+            "query_compare_days": 0,
+            "matched_days": 0,
+            "coverage": 0.0,
+            "coverage_factor": 1.0,
+            "length_relation": "",
+        }
+        if not query_days or not candidate_days:
+            return None, [], None, stats
+
+        by_day = {item["day_index"]: item for item in candidate_days}
+        weights = {1: 0.30, 2: 0.22, 3: 0.16}
+        details = []
+        weighted_scores = []
+        total_weight = 0.0
+        compare_days = [
+            q_day for q_day in query_days
+            if not (max_days > 0 and q_day["day_index"] > max_days)
+        ]
+        stats["query_compare_days"] = len(compare_days)
+        if len(candidate_days) < len(compare_days):
+            stats["length_relation"] = "candidate_shorter"
+        elif len(candidate_days) > len(compare_days):
+            stats["length_relation"] = "candidate_longer"
+        else:
+            stats["length_relation"] = "same_length"
+
+        for q_day in compare_days:
+            day_index = q_day["day_index"]
+            candidates = []
+            for offset, align_weight in ((0, 1.0), (-1, 0.85), (1, 0.85)):
+                cand = by_day.get(day_index + offset)
+                if not cand:
+                    continue
+                sim = self._day_pair_similarity(q_day, cand)
+                if sim is not None:
+                    candidates.append((sim * align_weight, sim, cand["day_index"]))
+            if not candidates:
+                continue
+            aligned_score, raw_score, matched_day = max(candidates, key=lambda x: x[0])
+            weight = weights.get(day_index, 0.08 if day_index <= 7 else 0.04)
+            weighted_scores.append(weight * aligned_score)
+            total_weight += weight
+            details.append({
+                "query_day": day_index,
+                "matched_day": matched_day,
+                "score": round(raw_score, 4),
+                "aligned_score": round(aligned_score, 4),
+            })
+
+        if total_weight == 0:
+            return None, details, None, stats
+
+        daily_score = sum(weighted_scores) / total_weight
+        trajectory_score = self._trajectory_similarity(compare_days, candidate_days)
+        if trajectory_score is not None:
+            daily_score = 0.85 * daily_score + 0.15 * trajectory_score
+
+        matched_days = len(details)
+        coverage = matched_days / len(compare_days) if compare_days else 0.0
+        # 温和惩罚：候选不会因天数不同被直接打死，但覆盖不足不能和完整覆盖同分。
+        coverage_factor = 0.70 + 0.30 * coverage
+        if coverage < 1.0:
+            daily_score *= coverage_factor
+        stats["matched_days"] = matched_days
+        stats["coverage"] = coverage
+        stats["coverage_factor"] = coverage_factor
+
+        return float(max(0.0, min(1.0, daily_score))), details, trajectory_score, stats
+
+    @staticmethod
+    def _trajectory_similarity(query_days: List[dict], candidate_days: List[dict]) -> Optional[float]:
+        q_seq = [d.get("trajectory_state") for d in query_days if d.get("trajectory_state")]
+        c_seq = [d.get("trajectory_state") for d in candidate_days if d.get("trajectory_state")]
+        if not q_seq or not c_seq:
+            return None
+
+        m, n = len(q_seq), len(c_seq)
+        prev = [0] * (n + 1)
+        for i in range(1, m + 1):
+            curr = [0] * (n + 1)
+            for j in range(1, n + 1):
+                if q_seq[i - 1] == c_seq[j - 1]:
+                    curr[j] = prev[j - 1] + 1
+                else:
+                    curr[j] = max(prev[j], curr[j - 1])
+            prev = curr
+        return prev[n] / max(m, n)
+
     def _save_index(self) -> None:
         """保存轻量配置文件（向量数据已通过 MySQL 持久化）"""
         if not self.index_path:
@@ -878,6 +1211,8 @@ class MedicalRecordSimilaritySystem:
         if self.enable_llm:
             self._load_case_cards()
 
+        self._load_day_index()
+
     def _load_case_cards(self) -> None:
         """加载病例卡和 embedding 到内存缓存（只加载当前 extractor_version，防止新旧混用）"""
         try:
@@ -911,6 +1246,36 @@ class MedicalRecordSimilaritySystem:
         except Exception as e:
             print(f"加载病例卡失败: {e}，LLM 增强功能不可用")
             self.enable_llm = False
+
+    def _load_day_index(self) -> None:
+        """加载天级记录缓存。天级表缺失或为空时静默回退到患者级检索。"""
+        try:
+            day_store = self._get_day_store()
+            self._day_records_by_patient = day_store.load_days_by_patient()
+            self._day_cards_by_patient = day_store.load_day_cards_by_patient(
+                extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION
+            )
+
+            # 预归一化每日 embedding。
+            for day_cards in self._day_cards_by_patient.values():
+                for item in day_cards:
+                    for key in ("day_delta_embedding", "cumulative_embedding"):
+                        emb = item.get(key)
+                        if emb is None:
+                            continue
+                        emb = emb.astype(np.float64)
+                        norm = np.linalg.norm(emb)
+                        if norm > 0:
+                            item[key] = (emb / norm).astype(np.float32)
+
+            day_count = sum(len(v) for v in self._day_records_by_patient.values())
+            card_count = sum(len(v) for v in self._day_cards_by_patient.values())
+            if day_count:
+                print(f"加载了 {day_count} 条天级记录，{card_count} 条天级病例卡")
+        except Exception as e:
+            print(f"加载天级索引失败: {e}，回退到患者级检索")
+            self._day_records_by_patient = {}
+            self._day_cards_by_patient = {}
 
     def get_stats(self) -> Dict:
         """获取系统统计信息"""

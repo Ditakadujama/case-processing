@@ -196,6 +196,15 @@ class MySQLVectorStore:
                 row = cursor.fetchone()
         return row['raw_text'] if row else None
 
+    def exists(self, record_id: str) -> bool:
+        """检查患者级向量记录是否已存在。"""
+        with get_db_connection(self._cfg) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM record_vectors WHERE record_id = %s LIMIT 1", (record_id,)
+                )
+                return cursor.fetchone() is not None
+
     def delete(self, record_id: str) -> None:
         """删除记录"""
         with get_db_connection(self._cfg) as conn:

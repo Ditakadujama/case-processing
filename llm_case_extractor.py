@@ -517,6 +517,51 @@ def build_case_card_prompt(context: str, record_id: str = "") -> str:
     return "\n".join(parts)
 
 
+def build_day_case_card_prompt(day_text: str,
+                               cumulative_text: str,
+                               patient_id: str,
+                               day_index: int,
+                               visit_date: str = "") -> str:
+    """构建每日病例卡抽取 prompt。"""
+    return f"""请从下面病历中抽取“患者第 {day_index} 天”的每日病例卡，只输出 JSON。
+
+患者ID：{patient_id}
+day_index：{day_index}
+visit_date：{visit_date}
+
+要求：
+1. 区分“当天新增/变化”和“截至当天累计状态”。
+2. 不要把风险告知、计划、必要时、可能发生当成已经发生。
+3. evidence 只放最短可核验原文片段。
+4. summary_for_embedding 重点写当天变化；cumulative_summary_for_embedding 写截至当天状态。
+
+JSON 字段：
+{{
+  "patient_id": "{patient_id}",
+  "day_index": {day_index},
+  "visit_date": "{visit_date}",
+  "day_summary": "",
+  "baseline_context": [],
+  "new_diagnoses": [],
+  "new_interventions": [],
+  "operations": [],
+  "organ_status": [],
+  "complications": [],
+  "clinical_state": "stable|improving|worsening|critical|post_operation|organ_support|transferred|death|unknown",
+  "evidence": [],
+  "day_summary_for_embedding": "",
+  "cumulative_summary_for_embedding": "",
+  "summary_for_embedding": ""
+}}
+
+【当天文本】
+{day_text}
+
+【截至当天累计文本】
+{cumulative_text}
+"""
+
+
 # ═══════════════════════════════════════════════════════════════════
 # LLM 调用
 # ═══════════════════════════════════════════════════════════════════
@@ -588,6 +633,64 @@ class LLMCaseExtractor:
         card["record_id"] = record_id
         card = validate_case_card(card, text)
 
+        return card
+
+    def extract_day(self,
+                    day_text: str,
+                    cumulative_text: str,
+                    patient_id: str,
+                    day_index: int,
+                    visit_date: str = "") -> Optional[dict]:
+        """抽取天级病例卡。"""
+        if not self.is_available:
+            logger.warning("LLM 服务未配置，跳过天级病例卡抽取")
+            return None
+
+        day_context = extract_llm_context(day_text, max_chars=max(2000, self.config.context_max_chars // 2))
+        cumulative_context = extract_llm_context(cumulative_text, max_chars=self.config.context_max_chars)
+        if not day_context.strip() and not cumulative_context.strip():
+            logger.warning(f"[{patient_id}#D{day_index:03d}] 天级 LLM 上下文为空，跳过")
+            return None
+
+        prompt = build_day_case_card_prompt(
+            day_context,
+            cumulative_context,
+            patient_id=patient_id,
+            day_index=day_index,
+            visit_date=visit_date,
+        )
+        record_id = f"{patient_id}#D{day_index:03d}"
+        raw_response = self._call_llm(prompt)
+        card = self._parse_json_response(raw_response, record_id, log_failure=False)
+        if card is None:
+            self._log_json_parse_failure(raw_response, record_id, stage="day_initial")
+            if self.config.enable_json_repair:
+                repaired_response = self._repair_json_response(raw_response, record_id)
+                card = self._parse_json_response(repaired_response, record_id, log_failure=False)
+                if card is None:
+                    self._log_json_parse_failure(repaired_response, record_id, stage="day_repair")
+
+        if card is None:
+            return None
+
+        card.setdefault("patient_id", patient_id)
+        card.setdefault("day_index", day_index)
+        card.setdefault("visit_date", visit_date)
+        card.setdefault("day_summary", "")
+        card.setdefault("baseline_context", [])
+        card.setdefault("new_diagnoses", [])
+        card.setdefault("new_interventions", [])
+        card.setdefault("operations", [])
+        card.setdefault("organ_status", [])
+        card.setdefault("complications", [])
+        card.setdefault("clinical_state", "unknown")
+        card.setdefault("evidence", [])
+        if not card.get("day_summary_for_embedding"):
+            card["day_summary_for_embedding"] = card.get("day_summary") or card.get("summary_for_embedding", "")
+        if not card.get("cumulative_summary_for_embedding"):
+            card["cumulative_summary_for_embedding"] = card.get("summary_for_embedding") or card.get("day_summary_for_embedding", "")
+        if not card.get("summary_for_embedding"):
+            card["summary_for_embedding"] = card.get("day_summary_for_embedding", "")
         return card
 
     def _call_llm(self, user_prompt: str, system_prompt: str = EXTRACTION_SYSTEM_PROMPT) -> str:

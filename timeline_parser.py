@@ -548,6 +548,33 @@ class TimelineParser:
             if e.timestamp and anchor <= e.timestamp < cutoff
         ]
 
+    def group_events_by_day(
+        self,
+        events: List[TimelineEvent],
+        anchor_date=None,
+    ) -> Dict[int, List[TimelineEvent]]:
+        """按相对住院日归并事件。anchor_date 可传 date 或 datetime；缺省使用入院锚点。"""
+        if anchor_date is None:
+            anchor = self.get_admission_anchor(events)
+            if anchor is None:
+                return {}
+            anchor_date = anchor.date()
+        elif hasattr(anchor_date, "date"):
+            anchor_date = anchor_date.date()
+
+        grouped: Dict[int, List[TimelineEvent]] = {}
+        for event in events:
+            if not event.timestamp:
+                continue
+            day_index = (event.timestamp.date() - anchor_date).days + 1
+            if day_index <= 0:
+                continue
+            grouped.setdefault(day_index, []).append(event)
+
+        for day_events in grouped.values():
+            day_events.sort(key=lambda e: e.timestamp)
+        return grouped
+
     def _extract_key_lab_values(self, text: str) -> Dict[str, str]:
         """从检验详情中提取关键指标数值"""
         values = {}
