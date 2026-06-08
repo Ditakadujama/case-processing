@@ -90,8 +90,8 @@ python main.py --build --workers 1 --limit 10
 # 跳过已有相同版本的病例卡记录
 python main.py --build --workers 8 --skip-existing-case-cards
 
-# 调整 LLM 并行线程数（IO 密集型，可适当增大）
-python main.py --build --workers 8 --llm-workers 10
+# 调整 LLM 并行线程数；如果 API 限速为 10 次/秒，可把请求间隔设为 0.1 秒
+python main.py --build --workers 8 --llm-workers 10 --llm-interval 0.1
 ```
 
 **Build 模式流程：**
@@ -142,6 +142,7 @@ python main.py --search "query_cases.xlsx" --timeline-days 7 --timeline-window-w
 | `--skip-existing-case-cards` | 兼容旧参数；当前 Build 默认已按患者级 + 天级索引增量跳过 | `False` |
 | `--rebuild-all` | Build 时清空患者级和天级索引后全量重建；不传则默认增量 | `False` |
 | `--llm-workers` | LLM 抽取并行线程数 | `5` |
+| `--llm-interval` | 两次 LLM 请求的最小间隔秒数；10次/秒限速可设为 `0.1` | `1.0` |
 | `--timeline-days` | Search 病程窗口天数（0=完整病程） | `0` |
 | `--timeline-window-weight` | Search 窗口病程权重（0~1） | `0.55` |
 | `--daily-days` | 天级比较天数：`0`=按查询病例全部已有天数比较；N>0=只比较前 N 天 | `0` |

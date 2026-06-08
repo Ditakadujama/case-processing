@@ -93,6 +93,7 @@ def safe_result_name(name: str) -> str:
 def build_index(num_workers: int = 1,
                 skip_existing: bool = True, limit: int = 0,
                 llm_workers: int = 5,
+                llm_interval: float = 1.0,
                 rebuild_all: bool = False):
     """
     build 模式：从 MySQL medical_records 原始表分批解析病历，提取特征向量，即时存入 record_vectors 表。
@@ -107,6 +108,7 @@ def build_index(num_workers: int = 1,
         num_workers: 并行进程数
         skip_existing: 是否跳过已有索引/同版本病例卡的记录
         limit: 限制处理条数（0=不限制，调试用）
+        llm_interval: 两次 LLM 请求的最小间隔秒数
         rebuild_all: 是否清空全部索引后重建
     """
     from vector_store import MySQLVectorStore
@@ -179,36 +181,56 @@ def build_index(num_workers: int = 1,
     system = create_system(data_dir="./data", threshold=0.45, db_config=cfg,
                           enable_llm=True)
     force_patient_card_ids = set()
+    existing_vector_count = store.count()
+    existing_card_count = cc_store.count()
+    existing_day_count = day_store.count_days()
+    existing_day_card_count = day_store.count_day_cards()
+
     if skip_existing and not rebuild_all:
         from day_store import DEFAULT_DAY_EXTRACTOR_VERSION as DAY_EXTRACTOR_VERSION
         from day_record_builder import DayRecordBuilder
         day_builder = DayRecordBuilder()
-        before_count = len(records)
-        filtered = {}
-        for record_id, text in records.items():
-            has_patient_vector = store.exists(record_id)
-            has_patient_card = cc_store.exists(record_id, DEFAULT_EXTRACTOR_VERSION)
-            expected_days = day_builder.build(record_id, text)
-            missing_days = [
-                day for day in expected_days
-                if (
-                    not day_store.day_exists(day.day_record_id)
-                    or not day_store.day_card_exists(
-                        day.day_record_id,
-                        extractor_version=DAY_EXTRACTOR_VERSION,
+        if (
+            existing_vector_count == 0
+            and existing_card_count == 0
+            and existing_day_count == 0
+            and existing_day_card_count == 0
+        ):
+            print("索引表为空，跳过增量存在性扫描，直接全量构建当前 medical_records")
+        else:
+            before_count = len(records)
+            filtered = {}
+            print(f"增量扫描：检查 {before_count} 个患者是否已有完整患者级/天级索引...")
+            for idx, (record_id, text) in enumerate(records.items(), start=1):
+                has_patient_vector = store.exists(record_id)
+                has_patient_card = cc_store.exists(record_id, DEFAULT_EXTRACTOR_VERSION)
+                expected_days = day_builder.build(record_id, text)
+                missing_days = [
+                    day for day in expected_days
+                    if (
+                        not day_store.day_exists(day.day_record_id)
+                        or not day_store.day_card_exists(
+                            day.day_record_id,
+                            extractor_version=DAY_EXTRACTOR_VERSION,
+                        )
                     )
-                )
-            ]
-            if has_patient_vector and has_patient_card and not missing_days:
-                continue
-            if missing_days:
-                # 同一 patient_id 新增了日期时，患者级全文也发生变化，需要刷新患者级病例卡。
-                force_patient_card_ids.add(record_id)
-            filtered[record_id] = text
-        records = filtered
-        skipped = before_count - len(records)
-        if skipped:
-            print(f"跳过患者级和天级索引均已存在的病例: {skipped} 条")
+                ]
+                if has_patient_vector and has_patient_card and not missing_days:
+                    pass
+                else:
+                    if missing_days:
+                        # 同一 patient_id 新增了日期时，患者级全文也发生变化，需要刷新患者级病例卡。
+                        force_patient_card_ids.add(record_id)
+                    filtered[record_id] = text
+
+                if idx % 100 == 0 or idx == before_count:
+                    print(f"\r  增量扫描进度: [{idx}/{before_count}] 待构建 {len(filtered)} 条",
+                          end="", flush=True)
+            print()
+            records = filtered
+            skipped = before_count - len(records)
+            if skipped:
+                print(f"跳过患者级和天级索引均已存在的病例: {skipped} 条")
 
     items = list(records.items())
     n = len(items)
@@ -239,12 +261,14 @@ def build_index(num_workers: int = 1,
                 _extract_case_cards_batch(
                     batch, llm_extractor, emb_service, cc_store,
                     skip_existing, system, llm_workers=llm_workers,
+                    llm_interval=llm_interval,
                     force_record_ids=force_patient_card_ids
                 )
                 day_records = _build_day_records_batch(batch, day_store, system)
                 _extract_day_case_cards_batch(
                     day_records, llm_extractor, emb_service, day_store,
-                    skip_existing=skip_existing, llm_workers=llm_workers
+                    skip_existing=skip_existing, llm_workers=llm_workers,
+                    llm_interval=llm_interval
                 )
         finally:
             if executor is not None:
@@ -260,12 +284,14 @@ def build_index(num_workers: int = 1,
             _extract_case_cards_batch(
                 batch, llm_extractor, emb_service, cc_store,
                 skip_existing, system, llm_workers=llm_workers,
+                llm_interval=llm_interval,
                 force_record_ids=force_patient_card_ids
             )
             day_records = _build_day_records_batch(batch, day_store, system)
             _extract_day_case_cards_batch(
                 day_records, llm_extractor, emb_service, day_store,
-                skip_existing=skip_existing, llm_workers=llm_workers
+                skip_existing=skip_existing, llm_workers=llm_workers,
+                llm_interval=llm_interval
             )
     system.save()
 
@@ -332,7 +358,8 @@ def _build_day_records_batch(batch: dict, day_store, system) -> list:
 
 def _extract_day_case_cards_batch(day_records: list, llm_extractor, emb_service,
                                   day_store, skip_existing: bool,
-                                  llm_workers: int = 5) -> None:
+                                  llm_workers: int = 5,
+                                  llm_interval: float = 1.0) -> None:
     """批量抽取每日病例卡 + day/cumulative embedding。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
@@ -347,7 +374,7 @@ def _extract_day_case_cards_batch(day_records: list, llm_extractor, emb_service,
     stats = {"success": 0, "skip": 0, "fail": 0}
     _next_request_time = 0.0
     _rate_lock = threading.Lock()
-    _min_interval = 1.0
+    _min_interval = max(float(llm_interval), 0.0)
 
     def _wait_rate_limit() -> None:
         nonlocal _next_request_time
@@ -425,6 +452,7 @@ def _extract_day_case_cards_batch(day_records: list, llm_extractor, emb_service,
 def _extract_case_cards_batch(batch: dict, llm_extractor, emb_service,
                               cc_store, skip_existing: bool, system,
                               llm_workers: int = 5,
+                              llm_interval: float = 1.0,
                               force_record_ids: set = None) -> None:
     """
     批量抽取病例卡 + embedding，写入 case_card_store。
@@ -453,7 +481,7 @@ def _extract_case_cards_batch(batch: dict, llm_extractor, emb_service,
     # 速率限制：每个请求之间至少间隔 interval 秒，避免触发 API 限流
     _next_request_time = 0.0
     _rate_lock = threading.Lock()
-    _min_interval = 1.0  # 两次 LLM 请求最小间隔（秒），可根据 API 限制调整
+    _min_interval = max(float(llm_interval), 0.0)  # 两次 LLM 请求最小间隔（秒）
 
     def _wait_rate_limit() -> None:
         """等待直到可以发送下一个请求"""
@@ -919,6 +947,8 @@ def main():
                         help='限制 build 处理条数（0=不限制，用于调试成本控制）')
     parser.add_argument('--llm-workers', type=int, default=5,
                         help='LLM 病例卡抽取并行线程数（默认 5，IO 密集型可适当增大）')
+    parser.add_argument('--llm-interval', type=float, default=1.0,
+                        help='两次 LLM 请求的最小间隔秒数；10次/秒限速可设为 0.1（默认 1.0）')
     parser.add_argument('--timeline-days', type=int, default=0,
                         help='病程窗口天数：0=完整住院病程；N>0=额外比较入院后前N天并与完整病程分融合')
     parser.add_argument('--timeline-window-weight', type=float, default=0.55,
@@ -955,6 +985,7 @@ def main():
             skip_existing=True,
             limit=args.limit,
             llm_workers=args.llm_workers,
+            llm_interval=args.llm_interval,
             rebuild_all=args.rebuild_all,
         )
     else:
