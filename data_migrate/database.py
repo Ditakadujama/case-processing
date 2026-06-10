@@ -209,6 +209,46 @@ def load_query_records_from_db(cfg: DBConfig) -> Dict[str, str]:
     return load_records_from_table(cfg, "query_records")
 
 
+def load_daily_rows_from_table(cfg: DBConfig, table_name: str) -> List[Dict[str, Any]]:
+    """
+    从指定病历表读取原始日级记录。
+
+    不合并、不改写字段；用于新的天级建库/检索流程。
+    """
+    allowed_tables = {"medical_records", "query_records"}
+    if table_name not in allowed_tables:
+        raise ValueError(f"不支持读取表: {table_name}")
+
+    sql = """
+        SELECT id, patient_id, visit_date, {}
+        FROM `{}`
+        ORDER BY patient_id, visit_date, id
+    """.format(", ".join(f"`{c}`" for c in RECORD_COLUMNS), table_name)
+
+    with get_db_connection(cfg) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+    for row in rows:
+        if row.get("visit_date") is not None:
+            row["visit_date"] = str(row["visit_date"])
+
+    logger.info(f"从 {table_name} 读取到 {len(rows)} 条原始日级记录")
+    return rows
+
+
+def load_medical_daily_rows(cfg: DBConfig) -> List[Dict[str, Any]]:
+    """从 medical_records 读取原始日级记录。"""
+    return load_daily_rows_from_table(cfg, "medical_records")
+
+
+def load_query_daily_rows(cfg: DBConfig) -> List[Dict[str, Any]]:
+    """从 query_records 读取原始日级记录。"""
+    init_query_records_table(cfg)
+    return load_daily_rows_from_table(cfg, "query_records")
+
+
 def insert_records(cfg: DBConfig, records_df: Any, table_name: str = "medical_records") -> int:
     """
     将 pandas DataFrame 批量写入病历表。

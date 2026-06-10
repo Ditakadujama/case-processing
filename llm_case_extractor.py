@@ -533,7 +533,9 @@ visit_date：{visit_date}
 1. 区分“当天新增/变化”和“截至当天累计状态”。
 2. 不要把风险告知、计划、必要时、可能发生当成已经发生。
 3. evidence 只放最短可核验原文片段。
-4. summary_for_embedding 重点写当天变化；cumulative_summary_for_embedding 写截至当天状态。
+4. final_diagnoses / primary_diagnosis_axis / etiology_axis 很重要，用来区分“表现相似但病因不同”的病例。
+5. 例如心脏骤停可以由冠心病/急性心梗导致，也可以由肺栓塞导致；必须把病因轴区分清楚。
+6. summary_for_embedding 重点写当天变化；cumulative_summary_for_embedding 写截至当天状态，并包含明确诊断/病因轴。
 
 JSON 字段：
 {{
@@ -541,6 +543,9 @@ JSON 字段：
   "day_index": {day_index},
   "visit_date": "{visit_date}",
   "day_summary": "",
+  "final_diagnoses": [],
+  "primary_diagnosis_axis": "",
+  "etiology_axis": "",
   "baseline_context": [],
   "new_diagnoses": [],
   "new_interventions": [],
@@ -677,6 +682,9 @@ class LLMCaseExtractor:
         card.setdefault("day_index", day_index)
         card.setdefault("visit_date", visit_date)
         card.setdefault("day_summary", "")
+        card.setdefault("final_diagnoses", [])
+        card.setdefault("primary_diagnosis_axis", "")
+        card.setdefault("etiology_axis", "")
         card.setdefault("baseline_context", [])
         card.setdefault("new_diagnoses", [])
         card.setdefault("new_interventions", [])

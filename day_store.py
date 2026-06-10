@@ -1,9 +1,4 @@
-"""
-MySQL 天级病历存储层。
-
-record_days 保存每天文本、结构化向量和时间轴特征；
-record_day_case_cards 保存每日 LLM 病例卡与 day/cumulative embedding。
-"""
+"""MySQL 天级病历存储层。"""
 
 import json
 import logging
@@ -15,7 +10,6 @@ from pymysql.cursors import DictCursor
 
 from config import DBConfig
 from data_migrate.database import get_db_connection
-from vector_store import _deserialize_timeline_features, _serialize_timeline_features
 
 logger = logging.getLogger(__name__)
 
@@ -26,18 +20,14 @@ CREATE TABLE IF NOT EXISTS record_days (
     patient_id VARCHAR(128) NOT NULL,
     day_index INT NOT NULL,
     visit_date DATE NULL,
-    day_text MEDIUMTEXT,
-    cumulative_text MEDIUMTEXT,
-    day_feature_vector BLOB,
-    cumulative_feature_vector BLOB,
-    day_timeline_features JSON,
-    trajectory_state VARCHAR(64) DEFAULT '',
+    day_text MEDIUMTEXT COMMENT '过滤后的医生关注文本',
+    cumulative_text MEDIUMTEXT COMMENT '截至当天的过滤后文本/状态输入',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_patient_day (patient_id, day_index),
     INDEX idx_patient_id (patient_id),
     INDEX idx_day_index (day_index)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='天级病历文本与硬特征表';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='天级医生关注病历文本表';
 """
 
 
@@ -51,7 +41,7 @@ CREATE TABLE IF NOT EXISTS record_day_case_cards (
     cumulative_summary_for_embedding TEXT,
     day_delta_embedding BLOB,
     cumulative_embedding BLOB,
-    extractor_version VARCHAR(64) DEFAULT 'day-v1.0',
+    extractor_version VARCHAR(64) DEFAULT 'day-v2.1-diagnosis-axis',
     embedding_model VARCHAR(128) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -62,7 +52,7 @@ CREATE TABLE IF NOT EXISTS record_day_case_cards (
 """
 
 
-DEFAULT_DAY_EXTRACTOR_VERSION = "day-v1.0"
+DEFAULT_DAY_EXTRACTOR_VERSION = "day-v2.1-diagnosis-axis"
 
 
 class MySQLDayStore:
@@ -101,21 +91,15 @@ class MySQLDayStore:
             return
 
         sql = """INSERT INTO record_days
-                 (day_record_id, patient_id, day_index, visit_date, day_text, cumulative_text,
-                  day_feature_vector, cumulative_feature_vector, day_timeline_features, trajectory_state)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 (day_record_id, patient_id, day_index, visit_date, day_text, cumulative_text)
+                 VALUES (%s, %s, %s, %s, %s, %s)
                  ON DUPLICATE KEY UPDATE
                   visit_date = VALUES(visit_date),
                   day_text = VALUES(day_text),
-                  cumulative_text = VALUES(cumulative_text),
-                  day_feature_vector = VALUES(day_feature_vector),
-                  cumulative_feature_vector = VALUES(cumulative_feature_vector),
-                  day_timeline_features = VALUES(day_timeline_features),
-                  trajectory_state = VALUES(trajectory_state)"""
+                  cumulative_text = VALUES(cumulative_text)"""
 
         serialized = []
-        for (day_record_id, patient_id, day_index, visit_date, day_text, cumulative_text,
-             day_vector, cumulative_vector, timeline_features, trajectory_state) in rows:
+        for (day_record_id, patient_id, day_index, visit_date, day_text, cumulative_text) in rows:
             serialized.append((
                 day_record_id,
                 patient_id,
@@ -123,11 +107,6 @@ class MySQLDayStore:
                 visit_date,
                 day_text,
                 cumulative_text,
-                day_vector.astype(np.float64).tobytes() if day_vector is not None else None,
-                cumulative_vector.astype(np.float64).tobytes() if cumulative_vector is not None else None,
-                json.dumps(_serialize_timeline_features(timeline_features), ensure_ascii=False)
-                if timeline_features is not None else None,
-                trajectory_state or "",
             ))
 
         conn = self._get_conn()
@@ -243,9 +222,7 @@ class MySQLDayStore:
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    """SELECT day_record_id, patient_id, day_index, visit_date, day_text,
-                              day_feature_vector, cumulative_feature_vector,
-                              day_timeline_features, trajectory_state
+                    """SELECT day_record_id, patient_id, day_index, visit_date, day_text, cumulative_text
                        FROM record_days
                        ORDER BY patient_id, day_index"""
                 )
@@ -255,21 +232,13 @@ class MySQLDayStore:
 
         result: Dict[str, List[dict]] = {}
         for row in rows:
-            tl_data = row.get("day_timeline_features")
-            if isinstance(tl_data, str):
-                tl_data = json.loads(tl_data) if tl_data else None
-            day_vector = row.get("day_feature_vector")
-            cumulative_vector = row.get("cumulative_feature_vector")
             item = {
                 "day_record_id": row["day_record_id"],
                 "patient_id": row["patient_id"],
                 "day_index": row["day_index"],
                 "visit_date": str(row["visit_date"]) if row.get("visit_date") else "",
                 "day_text": row.get("day_text") or "",
-                "day_feature_vector": np.frombuffer(day_vector, dtype=np.float64) if day_vector else None,
-                "cumulative_feature_vector": np.frombuffer(cumulative_vector, dtype=np.float64) if cumulative_vector else None,
-                "day_timeline_features": _deserialize_timeline_features(tl_data),
-                "trajectory_state": row.get("trajectory_state") or "",
+                "cumulative_text": row.get("cumulative_text") or "",
             }
             result.setdefault(row["patient_id"], []).append(item)
         return result
