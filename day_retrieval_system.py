@@ -136,6 +136,38 @@ def _has_diagnosis_axis_conflict(query_card: Optional[dict], cand_card: Optional
     return bool(q_axis and c_axis and q_axis != c_axis)
 
 
+def _diagnosis_conflict_summary(details: List[dict]) -> dict:
+    """汇总一个候选患者在逐日对齐中的诊断/病因轴冲突。"""
+    conflicts = [item for item in details if item.get("diagnosis_axis_conflict")]
+    compared = [
+        item for item in details
+        if item.get("query_diagnosis_axis") and item.get("matched_diagnosis_axis")
+    ]
+    return {
+        "diagnosis_conflict_days": [item.get("query_day") for item in conflicts],
+        "diagnosis_conflict_count": len(conflicts),
+        "diagnosis_compared_days": len(compared),
+        "diagnosis_conflict_ratio": (len(conflicts) / len(compared)) if compared else 0.0,
+        "first_day_diagnosis_conflict": any(
+            item.get("query_day") == 1 for item in conflicts
+        ),
+    }
+
+
+def _passes_diagnosis_gate(conflict_summary: dict) -> bool:
+    """宁缺毋滥：诊断/病因轴明显不一致时，不为了凑满 Top5 返回。"""
+    compared = conflict_summary.get("diagnosis_compared_days", 0)
+    if compared == 0:
+        return True
+    if conflict_summary.get("first_day_diagnosis_conflict"):
+        return False
+    if conflict_summary.get("diagnosis_conflict_count", 0) >= 2:
+        return False
+    if conflict_summary.get("diagnosis_conflict_ratio", 0.0) > 0.20:
+        return False
+    return True
+
+
 def _jaccard(a: set, b: set) -> Optional[float]:
     if not a and not b:
         return None
@@ -225,6 +257,9 @@ class DayLevelRetrievalSystem:
             )
             if score is None:
                 continue
+            conflict_summary = _diagnosis_conflict_summary(details)
+            if not _passes_diagnosis_gate(conflict_summary):
+                continue
             candidates.append({
                 "id": patient_id,
                 "similarity": round(score, 4),
@@ -237,6 +272,7 @@ class DayLevelRetrievalSystem:
                 "daily_coverage": round(stats["coverage"], 4),
                 "daily_length_relation": stats["length_relation"],
                 "daily_coverage_factor": round(stats["coverage_factor"], 4),
+                **conflict_summary,
                 "daily_match_details": details,
                 "full_text": self._format_candidate_text(patient_id, details),
             })
