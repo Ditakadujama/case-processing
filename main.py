@@ -117,12 +117,13 @@ def build_index(skip_existing: bool = True,
     day_records = build_clinical_day_records(rows)
     before = len(day_records)
     if skip_existing and not rebuild_all:
+        all_ids = [day.day_record_id for day in day_records]
+        existing_day_set = day_store.existing_day_ids(all_ids)
+        existing_card_set = day_store.existing_day_card_ids(all_ids, DEFAULT_DAY_EXTRACTOR_VERSION)
         day_records = [
             day for day in day_records
-            if (
-                not day_store.day_exists(day.day_record_id)
-                or not day_store.day_card_exists(day.day_record_id, DEFAULT_DAY_EXTRACTOR_VERSION)
-            )
+            if day.day_record_id not in existing_day_set
+            or day.day_record_id not in existing_card_set
         ]
         skipped = before - len(day_records)
         if skipped:

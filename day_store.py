@@ -185,6 +185,45 @@ class MySQLDayStore:
         finally:
             conn.close()
 
+    def existing_day_ids(self, day_record_ids: list[str]) -> set[str]:
+        """批量检查哪些 day_record_id 已存在（单次连接，避免端口耗尽）。"""
+        if not day_record_ids:
+            return set()
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cursor:
+                # 用 IN + 参数化查询，一次性获取所有已有的 ID
+                placeholders = ",".join(["%s"] * len(day_record_ids))
+                cursor.execute(
+                    f"SELECT day_record_id FROM record_days WHERE day_record_id IN ({placeholders})",
+                    day_record_ids,
+                )
+                return {row["day_record_id"] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def existing_day_card_ids(
+        self,
+        day_record_ids: list[str],
+        extractor_version: str = DEFAULT_DAY_EXTRACTOR_VERSION,
+    ) -> set[str]:
+        """批量检查哪些 day_record_id 已有当前版本病例卡（单次连接）。"""
+        if not day_record_ids:
+            return set()
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cursor:
+                placeholders = ",".join(["%s"] * len(day_record_ids))
+                cursor.execute(
+                    f"""SELECT day_record_id FROM record_day_case_cards
+                        WHERE day_record_id IN ({placeholders})
+                          AND extractor_version = %s""",
+                    (*day_record_ids, extractor_version),
+                )
+                return {row["day_record_id"] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
     def patient_has_days(self, patient_id: str) -> bool:
         """检查某患者是否已有天级硬特征。"""
         conn = self._get_conn()
