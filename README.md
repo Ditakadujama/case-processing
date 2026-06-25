@@ -55,6 +55,8 @@ python main.py --build --rebuild-all --llm-workers 2 --llm-interval 6.5
 python main.py --build --limit 300 --llm-workers 1 --llm-interval 7
 ```
 
+`--limit` 限制的是患者数，不是原始日记录数；例如 `--limit 200` 会处理前 200 个患者的全部日记录。
+
 ## Search
 
 查询 Excel 格式与迁移 Excel 一致，至少包含：
@@ -66,6 +68,42 @@ python main.py --build --limit 300 --llm-workers 1 --llm-interval 7
 
 ```bash
 python main.py --search path-of-excel.xlsx
+```
+
+默认会先用现有天级相似度初筛候选，再对前 10 个候选做二阶段 rerank。
+如果配置了独立 reranker 服务，会优先使用该服务，例如服务器上的 Qwen3-Reranker-4B：
+
+```bash
+export RERANKER_API_BASE="http://your-server:port"
+export RERANKER_MODEL="qwen3-reranker-4b"
+export RERANKER_ENDPOINT="/score"
+python main.py --search path-of-excel.xlsx
+```
+
+如果使用项目配套的 `launch.py`，服务接口是：
+
+- `POST /score`：返回原始顺序分数，推荐用于本项目
+- `POST /rerank`：服务端先排序，项目也能按 `index` 解析
+- `GET /health`：健康检查
+
+请求格式：
+
+```json
+{
+  "model": "qwen3-reranker-4b",
+  "query": "...",
+  "documents": ["候选1", "候选2"],
+  "instruction": "判断候选重症医学病例是否与查询病例在最终诊断、病因链、疾病阶段、关键病程和关键治疗上相似。"
+}
+```
+
+如果服务使用 `texts` 而不是 `documents`，系统会自动重试一次。
+
+未配置 `RERANKER_API_BASE` 时，会退回到 LLM JSON reranker。
+如果接口限速是 10/min，默认 `--rerank-interval 6.5` 更稳；如果不想用 reranker：
+
+```bash
+python main.py --search path-of-excel.xlsx --rerank-top-n 0
 ```
 
 只比较查询病例前 N 天：
@@ -87,13 +125,30 @@ data/results/
 - `final_diagnoses`
 - `primary_diagnosis_axis`
 - `etiology_axis`
+- `etiology_chain`
 
-检索时会把病因轴作为强信号。比如同样出现心脏骤停：
+检索时会把病因链作为强信号，并在初筛 TopN 后交给 reranker 做二阶段精排。比如同样出现心脏骤停：
 
 - 冠心病/急性心梗
 - 肺栓塞
 
 这两类会被识别为病因轴冲突，并在天级匹配中惩罚。
+
+感染/脓毒症病例会进一步比较：
+
+- 感染来源：泌尿系、肺部、腹腔/胆道、导管相关、皮肤软组织等
+- 基础诱因：结石/梗阻、术后、创伤、肿瘤、免疫抑制等
+- 病理过程：脓毒症、感染性休克、呼吸衰竭、肾衰等
+- 关键处理：解除梗阻、PCI、抗凝/溶栓、机械通气、CRRT 等
+
+因此“感染性休克”只是共同表现，不能单独决定高排名；如果感染来源或基础诱因明显不一致，会降权或被宁缺毋滥过滤。
+
+二阶段 reranker 会进一步判断或评分：
+
+- 最终诊断/病因链是否一致
+- 病程阶段是否一致
+- 关键匹配点和关键冲突点
+- 是否应推荐给医生，或宁缺毋滥拒绝
 
 ## 主要文件
 

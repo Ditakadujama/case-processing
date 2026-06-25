@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS record_day_case_cards (
     cumulative_summary_for_embedding TEXT,
     day_delta_embedding BLOB,
     cumulative_embedding BLOB,
-    extractor_version VARCHAR(64) DEFAULT 'day-v2.1-diagnosis-axis',
+    extractor_version VARCHAR(64) DEFAULT 'day-v2.2-etiology-chain',
     embedding_model VARCHAR(128) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS record_day_case_cards (
 """
 
 
-DEFAULT_DAY_EXTRACTOR_VERSION = "day-v2.1-diagnosis-axis"
+DEFAULT_DAY_EXTRACTOR_VERSION = "day-v2.2-etiology-chain"
 
 
 class MySQLDayStore:

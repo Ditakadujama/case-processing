@@ -4,11 +4,12 @@
 所有配置读取优先级：环境变量 > .env 文件 > 代码默认值。
 
 用法:
-    from config import DBConfig, LLMConfig, EmbeddingConfig
+    from config import DBConfig, LLMConfig, EmbeddingConfig, RerankerConfig
 
     db_cfg = DBConfig.from_env()
     llm_cfg = LLMConfig()
     emb_cfg = EmbeddingConfig()
+    reranker_cfg = RerankerConfig()
 """
 
 import os
@@ -143,3 +144,33 @@ class EmbeddingConfig:
     @property
     def is_configured(self) -> bool:
         return bool(self.api_base and self.api_key)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Reranker 配置
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class RerankerConfig:
+    """Reranker 服务配置（常见 /v1/rerank 或 /rerank HTTP API）"""
+    api_base: str = field(default_factory=lambda: os.environ.get("RERANKER_API_BASE", ""))
+    api_key: str = field(default_factory=lambda: os.environ.get("RERANKER_API_KEY", ""))
+    model: str = field(default_factory=lambda: os.environ.get("RERANKER_MODEL", "qwen3-reranker-4b"))
+    endpoint: str = field(default_factory=lambda: os.environ.get("RERANKER_ENDPOINT", "/score"))
+    instruction: str = field(default_factory=lambda: os.environ.get(
+        "RERANKER_INSTRUCTION",
+        "判断候选重症医学病例是否与查询病例在最终诊断、病因链、疾病阶段、关键病程和关键治疗上相似。"
+        "最终诊断/病因链一致性最重要；不要仅因同为休克、插管、ICU、呼吸衰竭等泛化危重表现就判为相似。",
+    ))
+    timeout: int = field(default_factory=lambda: int(os.environ.get("RERANKER_TIMEOUT", "120")))
+    max_retries: int = field(default_factory=lambda: int(os.environ.get("RERANKER_MAX_RETRIES", "2")))
+    max_query_chars: int = field(default_factory=lambda: int(os.environ.get("RERANKER_MAX_QUERY_CHARS", "8000")))
+    max_doc_chars: int = field(default_factory=lambda: int(os.environ.get("RERANKER_MAX_DOC_CHARS", "8000")))
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.api_base)
+
+    @property
+    def url(self) -> str:
+        return f"{self.api_base.rstrip('/')}/{self.endpoint.lstrip('/')}"

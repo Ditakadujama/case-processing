@@ -9,10 +9,11 @@ import re
 import numpy as np
 
 from clinical_text_filter import ClinicalDayRecord, build_clinical_day_records
-from config import DBConfig, EmbeddingConfig, LLMConfig
+from config import DBConfig, EmbeddingConfig, LLMConfig, RerankerConfig
 from day_store import DEFAULT_DAY_EXTRACTOR_VERSION, MySQLDayStore
 from embedding_index import EmbeddingService
 from llm_case_extractor import LLMCaseExtractor
+from llm_reranker import HTTPReranker, LLMReranker
 
 
 def _vector_cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
@@ -59,6 +60,28 @@ def _normalize_embedding(value: Optional[np.ndarray]) -> Optional[np.ndarray]:
     return emb.astype(np.float32)
 
 
+def _as_list(value) -> List:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _collect_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(_collect_text(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_collect_text(v) for v in value)
+    return str(value)
+
+
 def _day_card_tags(card: Optional[dict]) -> set:
     if not card:
         return set()
@@ -73,20 +96,178 @@ def _day_card_tags(card: Optional[dict]) -> set:
         "operations",
         "organ_status",
         "complications",
+        "etiology_chain",
     ):
-        values = card.get(key) or []
+        values = _as_list(card.get(key))
         for value in values:
             if isinstance(value, str):
                 tags.add(value.strip())
             elif isinstance(value, dict):
-                for sub_key in ("name", "label", "type", "status"):
+                for sub_key in (
+                    "name",
+                    "label",
+                    "type",
+                    "status",
+                    "disease_category",
+                    "direct_cause",
+                    "source_or_site",
+                    "anatomic_location",
+                    "underlying_trigger",
+                    "certainty",
+                ):
                     sub_val = value.get(sub_key)
                     if sub_val:
                         tags.add(str(sub_val).strip())
+                for sub_key in ("pathophysiology", "key_interventions"):
+                    for sub_val in _as_list(value.get(sub_key)):
+                        if sub_val:
+                            tags.add(str(sub_val).strip())
     state = card.get("clinical_state")
     if state:
         tags.add(f"state:{state}")
     return {tag for tag in tags if tag}
+
+
+ETIOLOGY_CHAIN_RULES = {
+    "source_or_site": {
+        "urinary": ("泌尿", "尿路", "尿源", "肾盂", "输尿管", "膀胱", "尿液", "尿培养"),
+        "pulmonary": ("肺部感染", "肺炎", "吸入", "痰培养", "呼吸道感染"),
+        "abdominal_biliary": ("腹腔", "胆道", "胆囊", "胆管", "胰腺", "肠", "消化道", "腹膜炎"),
+        "catheter": ("导管", "中心静脉", "PICC", "置管", "导管相关"),
+        "skin_soft_tissue": ("皮肤", "软组织", "创面", "坏死性筋膜炎", "蜂窝织炎"),
+        "cns": ("颅内感染", "脑膜炎", "中枢神经"),
+    },
+    "underlying_trigger": {
+        "stone_obstruction": ("结石", "梗阻", "积水", "输尿管支架", "DJ管", "解除梗阻"),
+        "post_operation": ("术后", "手术后", "围手术期"),
+        "trauma": ("外伤", "创伤", "车祸", "坠落", "摔伤"),
+        "malignancy": ("肿瘤", "癌", "恶性"),
+        "immunosuppression": ("免疫抑制", "化疗", "激素", "移植"),
+        "coronary_plaque": ("冠心病", "冠脉", "斑块", "PCI", "支架", "心肌梗死", "心梗"),
+        "embolism": ("肺栓塞", "血栓", "栓塞", "D-二聚体"),
+        "dissection": ("主动脉夹层", "夹层"),
+    },
+    "pathophysiology": {
+        "septic_shock": ("感染性休克", "脓毒性休克", "脓毒症休克"),
+        "sepsis": ("脓毒症", "败血症", "严重感染"),
+        "cardiogenic_shock": ("心源性休克", "泵衰竭"),
+        "cardiac_arrest": ("心脏骤停", "心跳骤停", "心肺复苏", "CPR"),
+        "respiratory_failure": ("呼吸衰竭", "低氧", "氧合"),
+        "renal_failure": ("肾功能不全", "肾衰", "急性肾损伤", "AKI"),
+    },
+    "key_interventions": {
+        "source_control_urinary": ("输尿管支架", "DJ管", "经皮肾", "造瘘", "碎石", "解除梗阻"),
+        "pci": ("PCI", "冠脉造影", "支架植入", "球囊扩张"),
+        "thrombolysis_anticoagulation": ("溶栓", "抗凝", "肝素", "利伐沙班"),
+        "mechanical_ventilation": ("机械通气", "气管插管", "呼吸机"),
+        "vasopressor": ("去甲肾上腺素", "升压", "血管活性"),
+        "crrt": ("CRRT", "血滤", "透析"),
+    },
+}
+
+
+def _rule_labels(text: str, group: str) -> set:
+    result = set()
+    for label, keywords in ETIOLOGY_CHAIN_RULES.get(group, {}).items():
+        if any(keyword in text for keyword in keywords):
+            result.add(label)
+    return result
+
+
+def _etiology_chain_labels(card: Optional[dict]) -> Dict[str, set]:
+    if not card:
+        return {}
+    chain = card.get("etiology_chain") if isinstance(card.get("etiology_chain"), dict) else {}
+    text = " ".join([
+        _collect_text(chain),
+        _collect_text(card.get("primary_diagnosis_axis")),
+        _collect_text(card.get("etiology_axis")),
+        _collect_text(card.get("final_diagnoses")),
+        _collect_text(card.get("new_diagnoses")),
+        _collect_text(card.get("day_summary")),
+        _collect_text(card.get("operations")),
+        _collect_text(card.get("new_interventions")),
+    ])
+    labels = {
+        "disease_category": set(),
+        "source_or_site": _rule_labels(text, "source_or_site"),
+        "underlying_trigger": _rule_labels(text, "underlying_trigger"),
+        "pathophysiology": _rule_labels(text, "pathophysiology"),
+        "key_interventions": _rule_labels(text, "key_interventions"),
+    }
+    disease_text = " ".join([
+        _collect_text(chain.get("disease_category")),
+        _collect_text(card.get("primary_diagnosis_axis")),
+        _collect_text(card.get("etiology_axis")),
+    ])
+    for axis, keywords in DIAGNOSIS_AXIS_RULES.items():
+        if any(keyword in disease_text or keyword in text for keyword in keywords):
+            labels["disease_category"].add(axis)
+    for key in ("disease_category", "direct_cause", "source_or_site", "anatomic_location", "underlying_trigger"):
+        value = chain.get(key)
+        if value:
+            labels.setdefault(key, set()).add(str(value).strip())
+    for key in ("pathophysiology", "key_interventions"):
+        for value in _as_list(chain.get(key)):
+            if value:
+                labels.setdefault(key, set()).add(str(value).strip())
+    return {key: {item for item in values if item} for key, values in labels.items()}
+
+
+def _display_etiology_chain_labels(card: Optional[dict]) -> Dict[str, List[str]]:
+    labels = _etiology_chain_labels(card)
+    return {key: sorted(values) for key, values in labels.items() if values}
+
+
+def _set_similarity(query_values: set, cand_values: set) -> Optional[float]:
+    if not query_values and not cand_values:
+        return None
+    if not query_values or not cand_values:
+        return 0.0
+    if query_values & cand_values:
+        return len(query_values & cand_values) / len(query_values | cand_values)
+    return 0.0
+
+
+def _etiology_chain_similarity(query_card: Optional[dict], cand_card: Optional[dict]) -> Optional[float]:
+    q = _etiology_chain_labels(query_card)
+    c = _etiology_chain_labels(cand_card)
+    if not q or not c:
+        return None
+    weighted_parts = []
+    for key, weight in (
+        ("disease_category", 0.15),
+        ("source_or_site", 0.25),
+        ("direct_cause", 0.10),
+        ("anatomic_location", 0.07),
+        ("underlying_trigger", 0.20),
+        ("pathophysiology", 0.15),
+        ("key_interventions", 0.08),
+    ):
+        sim = _set_similarity(q.get(key, set()), c.get(key, set()))
+        if sim is not None:
+            weighted_parts.append((weight, sim))
+    if not weighted_parts:
+        return None
+    total = sum(weight for weight, _ in weighted_parts)
+    return float(sum(weight * score for weight, score in weighted_parts) / total)
+
+
+def _has_etiology_chain_conflict(query_card: Optional[dict], cand_card: Optional[dict]) -> bool:
+    q = _etiology_chain_labels(query_card)
+    c = _etiology_chain_labels(cand_card)
+    if not q or not c:
+        return False
+    q_axis = _diagnosis_axis(query_card)
+    c_axis = _diagnosis_axis(cand_card)
+    if q_axis and c_axis and q_axis != c_axis:
+        return True
+    for key in ("source_or_site", "underlying_trigger"):
+        q_values = q.get(key, set())
+        c_values = c.get(key, set())
+        if q_values and c_values and not (q_values & c_values):
+            return True
+    return False
 
 
 DIAGNOSIS_AXIS_RULES = {
@@ -139,31 +320,52 @@ def _has_diagnosis_axis_conflict(query_card: Optional[dict], cand_card: Optional
 def _diagnosis_conflict_summary(details: List[dict]) -> dict:
     """汇总一个候选患者在逐日对齐中的诊断/病因轴冲突。"""
     conflicts = [item for item in details if item.get("diagnosis_axis_conflict")]
+    etiology_conflicts = [item for item in details if item.get("etiology_chain_conflict")]
     compared = [
         item for item in details
         if item.get("query_diagnosis_axis") and item.get("matched_diagnosis_axis")
+    ]
+    etiology_compared = [
+        item for item in details
+        if item.get("etiology_chain_similarity") != "-"
     ]
     return {
         "diagnosis_conflict_days": [item.get("query_day") for item in conflicts],
         "diagnosis_conflict_count": len(conflicts),
         "diagnosis_compared_days": len(compared),
         "diagnosis_conflict_ratio": (len(conflicts) / len(compared)) if compared else 0.0,
+        "etiology_chain_conflict_days": [item.get("query_day") for item in etiology_conflicts],
+        "etiology_chain_conflict_count": len(etiology_conflicts),
+        "etiology_chain_compared_days": len(etiology_compared),
+        "etiology_chain_conflict_ratio": (
+            len(etiology_conflicts) / len(etiology_compared)
+        ) if etiology_compared else 0.0,
         "first_day_diagnosis_conflict": any(
             item.get("query_day") == 1 for item in conflicts
+        ),
+        "first_day_etiology_chain_conflict": any(
+            item.get("query_day") == 1 for item in etiology_conflicts
         ),
     }
 
 
 def _passes_diagnosis_gate(conflict_summary: dict) -> bool:
     """宁缺毋滥：诊断/病因轴明显不一致时，不为了凑满 Top5 返回。"""
-    compared = conflict_summary.get("diagnosis_compared_days", 0)
-    if compared == 0:
+    diagnosis_compared = conflict_summary.get("diagnosis_compared_days", 0)
+    etiology_compared = conflict_summary.get("etiology_chain_compared_days", 0)
+    if diagnosis_compared == 0 and etiology_compared == 0:
         return True
     if conflict_summary.get("first_day_diagnosis_conflict"):
         return False
+    if conflict_summary.get("first_day_etiology_chain_conflict"):
+        return False
     if conflict_summary.get("diagnosis_conflict_count", 0) >= 2:
         return False
+    if conflict_summary.get("etiology_chain_conflict_count", 0) >= 2:
+        return False
     if conflict_summary.get("diagnosis_conflict_ratio", 0.0) > 0.20:
+        return False
+    if conflict_summary.get("etiology_chain_conflict_ratio", 0.0) > 0.34:
         return False
     return True
 
@@ -184,6 +386,8 @@ class DayLevelRetrievalSystem:
         self.day_store = MySQLDayStore(db_config)
         self.day_store.init_tables()
         self.llm_extractor = LLMCaseExtractor(LLMConfig())
+        self.http_reranker = HTTPReranker(RerankerConfig())
+        self.llm_reranker = LLMReranker(LLMConfig())
         self.emb_service = EmbeddingService(EmbeddingConfig())
         self._day_records_by_patient: Dict[str, List[dict]] = {}
         self._day_cards_by_patient: Dict[str, List[dict]] = {}
@@ -246,7 +450,10 @@ class DayLevelRetrievalSystem:
 
     def search(self, query_days: List[dict], top_k: int = 5,
                exclude_patient_ids: Optional[set] = None,
-               max_days: int = 0) -> List[dict]:
+               max_days: int = 0,
+               rerank_top_n: int = 0,
+               rerank_interval: float = 0.0,
+               candidate_pool_size: int = 30) -> List[dict]:
         exclude_patient_ids = exclude_patient_ids or set()
         candidates = []
         for patient_id in self._day_records_by_patient:
@@ -278,6 +485,20 @@ class DayLevelRetrievalSystem:
             })
 
         candidates.sort(key=lambda item: item["similarity"], reverse=True)
+        if rerank_top_n > 0 and (self.http_reranker.is_available or self.llm_reranker.is_available):
+            pool_size = max(top_k, rerank_top_n, candidate_pool_size)
+            active_reranker = self.http_reranker if self.http_reranker.is_available else self.llm_reranker
+            candidates = active_reranker.rerank_candidates(
+                query_days,
+                candidates[:pool_size],
+                top_n=rerank_top_n,
+                interval=rerank_interval,
+            )
+            filtered = [
+                item for item in candidates
+                if item.get("rerank_decision") not in {"reject", "unknown"}
+            ]
+            candidates = filtered or candidates
         return candidates[:top_k]
 
     def _extract_query_day_card(self, day: ClinicalDayRecord) -> Optional[dict]:
@@ -313,25 +534,29 @@ class DayLevelRetrievalSystem:
 
     def _day_pair_similarity(self, query_day: dict, cand_day: dict) -> Optional[float]:
         parts = []
+        etiology_sim = _etiology_chain_similarity(query_day.get("case_card"), cand_day.get("case_card"))
+        if etiology_sim is not None:
+            parts.append((0.35, etiology_sim))
+
         diagnosis_sim = _diagnosis_axis_similarity(query_day.get("case_card"), cand_day.get("case_card"))
         if diagnosis_sim is not None:
-            parts.append((0.30, diagnosis_sim))
+            parts.append((0.20, diagnosis_sim))
 
         day_emb = _vector_cosine(query_day.get("day_delta_embedding"), cand_day.get("day_delta_embedding"))
         if day_emb is not None:
-            parts.append((0.40, max(0.0, day_emb)))
+            parts.append((0.30, max(0.0, day_emb)))
 
         tag_sim = _jaccard(_day_card_tags(query_day.get("case_card")), _day_card_tags(cand_day.get("case_card")))
         if tag_sim is not None:
-            parts.append((0.20, tag_sim))
+            parts.append((0.15, tag_sim))
 
         cumulative_emb = _vector_cosine(query_day.get("cumulative_embedding"), cand_day.get("cumulative_embedding"))
         if cumulative_emb is not None:
-            parts.append((0.15, max(0.0, cumulative_emb)))
+            parts.append((0.10, max(0.0, cumulative_emb)))
 
         text_sim = _counter_cosine(query_day.get("text_vector"), cand_day.get("text_vector"))
         if text_sim is not None:
-            parts.append((0.10, text_sim))
+            parts.append((0.08, text_sim))
 
         if not parts:
             return None
@@ -339,6 +564,8 @@ class DayLevelRetrievalSystem:
         score = float(sum(weight * score for weight, score in parts) / total)
         if _has_diagnosis_axis_conflict(query_day.get("case_card"), cand_day.get("case_card")):
             score *= 0.70
+        if _has_etiology_chain_conflict(query_day.get("case_card"), cand_day.get("case_card")):
+            score *= 0.55
         return score
 
     def _daily_patient_similarity(self, query_days: List[dict], patient_id: str,
@@ -383,6 +610,10 @@ class DayLevelRetrievalSystem:
             weight = weights.get(q_index, 0.08 if q_index <= 7 else 0.04)
             weighted_scores.append(weight * aligned_score)
             total_weight += weight
+            etiology_chain_similarity = _etiology_chain_similarity(
+                query_day.get("case_card"),
+                matched_day.get("case_card"),
+            )
             details.append({
                 "query_day": q_index,
                 "query_date": query_day.get("visit_date", ""),
@@ -393,6 +624,17 @@ class DayLevelRetrievalSystem:
                 "query_diagnosis_axis": _diagnosis_axis(query_day.get("case_card")),
                 "matched_diagnosis_axis": _diagnosis_axis(matched_day.get("case_card")),
                 "diagnosis_axis_conflict": _has_diagnosis_axis_conflict(
+                    query_day.get("case_card"),
+                    matched_day.get("case_card"),
+                ),
+                "etiology_chain_similarity": (
+                    round(etiology_chain_similarity, 4)
+                    if etiology_chain_similarity is not None
+                    else "-"
+                ),
+                "query_etiology_chain": _display_etiology_chain_labels(query_day.get("case_card")),
+                "matched_etiology_chain": _display_etiology_chain_labels(matched_day.get("case_card")),
+                "etiology_chain_conflict": _has_etiology_chain_conflict(
                     query_day.get("case_card"),
                     matched_day.get("case_card"),
                 ),

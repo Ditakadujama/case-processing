@@ -108,8 +108,19 @@ def build_index(skip_existing: bool = True,
 
     rows = load_medical_daily_rows(cfg)
     if limit > 0:
-        rows = rows[:limit]
-        print(f"限制处理前 {limit} 条原始日记录")
+        selected_patient_ids = []
+        seen_patient_ids = set()
+        for row in rows:
+            patient_id = str(row.get("patient_id") or "").strip()
+            if not patient_id or patient_id in seen_patient_ids:
+                continue
+            seen_patient_ids.add(patient_id)
+            selected_patient_ids.append(patient_id)
+            if len(selected_patient_ids) >= limit:
+                break
+        selected_patient_set = set(selected_patient_ids)
+        rows = [row for row in rows if str(row.get("patient_id") or "").strip() in selected_patient_set]
+        print(f"限制处理前 {limit} 个患者，共 {len(rows)} 条原始日记录")
     if not rows:
         print("medical_records 中没有原始记录，请先迁移数据")
         return
@@ -263,7 +274,11 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
     print()
 
 
-def search(search_excel: str, daily_days: int = 0) -> None:
+def search(search_excel: str,
+           daily_days: int = 0,
+           rerank_top_n: int = 10,
+           rerank_interval: float = 6.5,
+           candidate_pool_size: int = 30) -> None:
     """从查询 Excel 检索相似患者。"""
     print("=" * 60)
     print("天级相似病例检索")
@@ -312,12 +327,18 @@ def search(search_excel: str, daily_days: int = 0) -> None:
             top_k=5,
             exclude_patient_ids={query_patient_id},
             max_days=daily_days,
+            rerank_top_n=rerank_top_n,
+            rerank_interval=rerank_interval,
+            candidate_pool_size=candidate_pool_size,
         )
         all_result_count += len(results)
         for i, result in enumerate(results, 1):
             print(f"  [{i}] {result['id']} 综合: {result['similarity']} "
                   f"匹配天数: {result['daily_matched_days']}/{result['daily_compare_days']} "
                   f"候选天数: {result['daily_candidate_days']}")
+            if result.get("rerank"):
+                print(f"      Rerank: {result.get('rerank_score')} / {result.get('rerank_decision')} "
+                      f"{result.get('rerank', {}).get('reason', '')[:80]}")
             print(f"      天级对齐: {result.get('daily_match_details', [])[:5]}")
 
         _write_query_result_file(result_dir, search_excel, query_patient_id, query_days, results)
@@ -355,6 +376,19 @@ def _write_query_result_file(result_dir: str, search_excel: str, query_patient_i
             f.write(f"诊断轴冲突天数: {result.get('diagnosis_conflict_count', 0)}\n")
             f.write(f"诊断轴冲突日: {result.get('diagnosis_conflict_days', [])}\n")
             f.write(f"首日诊断轴冲突: {'是' if result.get('first_day_diagnosis_conflict') else '否'}\n")
+            f.write(f"病因链比较天数: {result.get('etiology_chain_compared_days', 0)}\n")
+            f.write(f"病因链冲突天数: {result.get('etiology_chain_conflict_count', 0)}\n")
+            f.write(f"病因链冲突日: {result.get('etiology_chain_conflict_days', [])}\n")
+            f.write(f"首日病因链冲突: {'是' if result.get('first_day_etiology_chain_conflict') else '否'}\n")
+            if result.get("rerank"):
+                rerank = result.get("rerank") or {}
+                f.write(f"LLM Rerank 分数: {rerank.get('relevance_score', '-')}\n")
+                f.write(f"LLM Rerank 结论: {rerank.get('decision', '-')}\n")
+                f.write(f"LLM 判断最终诊断/病因一致: {'是' if rerank.get('same_final_diagnosis_or_etiology') else '否'}\n")
+                f.write(f"LLM 判断病程阶段一致: {'是' if rerank.get('same_disease_stage') else '否'}\n")
+                f.write(f"LLM 关键匹配: {rerank.get('key_matches', [])}\n")
+                f.write(f"LLM 关键冲突: {rerank.get('key_conflicts', [])}\n")
+                f.write(f"LLM 理由: {rerank.get('reason', '')}\n")
             f.write(f"天级对齐明细: {result.get('daily_match_details', [])}\n")
             f.write("\n--- 匹配候选天文本 ---\n")
             f.write(result.get("full_text", ""))
@@ -376,13 +410,19 @@ def main() -> None:
     parser.add_argument("--rebuild-all", action="store_true", default=False,
                         help="清空天级索引表后重新全量 build")
     parser.add_argument("--limit", type=int, default=0,
-                        help="限制 build 处理原始日记录条数（0=不限制）")
+                        help="限制 build 处理患者数（0=不限制）；会处理这些患者的全部日记录")
     parser.add_argument("--llm-workers", type=int, default=5,
                         help="LLM 日病例卡抽取并行线程数")
     parser.add_argument("--llm-interval", type=float, default=1.0,
                         help="两次 LLM 请求的最小间隔秒数；10次/秒限速可设为 0.1")
     parser.add_argument("--daily-days", type=int, default=0,
                         help="天级比较天数：0=按查询病例全部已有天数比较；N>0=只比较前 N 天")
+    parser.add_argument("--rerank-top-n", type=int, default=10,
+                        help="LLM 二阶段精排候选数；0=关闭 reranker")
+    parser.add_argument("--rerank-interval", type=float, default=6.5,
+                        help="LLM rerank 请求间隔秒数；10/min 限速建议设为 6.5")
+    parser.add_argument("--candidate-pool-size", type=int, default=30,
+                        help="进入二阶段前的初筛候选池大小")
     args = parser.parse_args()
 
     print("\n")
@@ -397,6 +437,12 @@ def main() -> None:
         parser.error("请指定 --build 或 --search EXCEL")
     if args.daily_days < 0:
         parser.error("--daily-days 不能小于 0")
+    if args.rerank_top_n < 0:
+        parser.error("--rerank-top-n 不能小于 0")
+    if args.rerank_interval < 0:
+        parser.error("--rerank-interval 不能小于 0")
+    if args.candidate_pool_size < 5:
+        parser.error("--candidate-pool-size 不能小于 5")
 
     if args.build:
         build_index(
@@ -407,7 +453,13 @@ def main() -> None:
             rebuild_all=args.rebuild_all,
         )
     else:
-        search(args.search, daily_days=args.daily_days)
+        search(
+            args.search,
+            daily_days=args.daily_days,
+            rerank_top_n=args.rerank_top_n,
+            rerank_interval=args.rerank_interval,
+            candidate_pool_size=args.candidate_pool_size,
+        )
 
 
 if __name__ == "__main__":

@@ -535,7 +535,10 @@ visit_date：{visit_date}
 3. evidence 只放最短可核验原文片段。
 4. final_diagnoses / primary_diagnosis_axis / etiology_axis 很重要，用来区分“表现相似但病因不同”的病例。
 5. 例如心脏骤停可以由冠心病/急性心梗导致，也可以由肺栓塞导致；必须把病因轴区分清楚。
-6. summary_for_embedding 重点写当天变化；cumulative_summary_for_embedding 写截至当天状态，并包含明确诊断/病因轴。
+6. etiology_chain 用来描述“为什么会成为这个病”：疾病大类、直接病因/感染源、解剖部位、基础诱因、关键病理过程、关键处理。
+7. 感染/脓毒症病例必须尽量区分感染来源和诱因，例如：泌尿系感染+输尿管结石/梗阻、肺部感染、腹腔/胆道感染、导管相关感染、皮肤软组织感染。
+8. 心血管急重症必须区分冠心病/急性心梗、肺栓塞、主动脉夹层、心律失常等病因。
+9. summary_for_embedding 重点写当天变化；cumulative_summary_for_embedding 写截至当天状态，并包含明确诊断/病因链。
 
 JSON 字段：
 {{
@@ -546,6 +549,16 @@ JSON 字段：
   "final_diagnoses": [],
   "primary_diagnosis_axis": "",
   "etiology_axis": "",
+  "etiology_chain": {{
+    "disease_category": "",
+    "direct_cause": "",
+    "source_or_site": "",
+    "anatomic_location": "",
+    "underlying_trigger": "",
+    "pathophysiology": [],
+    "key_interventions": [],
+    "certainty": "confirmed|suspected|unknown"
+  }},
   "baseline_context": [],
   "new_diagnoses": [],
   "new_interventions": [],
@@ -685,6 +698,7 @@ class LLMCaseExtractor:
         card.setdefault("final_diagnoses", [])
         card.setdefault("primary_diagnosis_axis", "")
         card.setdefault("etiology_axis", "")
+        card.setdefault("etiology_chain", {})
         card.setdefault("baseline_context", [])
         card.setdefault("new_diagnoses", [])
         card.setdefault("new_interventions", [])
