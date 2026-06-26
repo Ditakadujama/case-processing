@@ -16,6 +16,7 @@ from typing import List
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from case_card_embedding import build_case_card_embedding_text
 from clinical_text_filter import ClinicalDayRecord, build_clinical_day_records
 from config import DBConfig, EmbeddingConfig, LLMConfig
 from data_migrate.database import (
@@ -231,25 +232,20 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
                 logger.warning(f"[{day.day_record_id}] 天级病例卡抽取失败")
                 return "fail"
 
-            day_embedding = None
-            cumulative_embedding = None
-            day_summary = card.get("day_summary_for_embedding") or card.get("summary_for_embedding", "")
-            cumulative_summary = card.get("cumulative_summary_for_embedding") or ""
+            case_card_embedding = None
+            embedding_text = build_case_card_embedding_text(card)
             try:
-                if day_summary:
-                    day_embedding = emb_service.embed_text(day_summary)
-                if cumulative_summary:
-                    cumulative_embedding = emb_service.embed_text(cumulative_summary)
+                if embedding_text:
+                    case_card_embedding = emb_service.embed_text(embedding_text)
             except Exception as e:
-                logger.warning(f"[{day.day_record_id}] 天级 embedding 生成失败: {e}")
+                logger.warning(f"[{day.day_record_id}] case_card_embedding 生成失败: {e}")
 
             day_store.insert_day_card(
                 day.day_record_id,
                 day.patient_id,
                 day.day_index,
                 card,
-                day_embedding,
-                cumulative_embedding,
+                case_card_embedding=case_card_embedding,
                 extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
                 embedding_model=embedding_model,
             )

@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS record_day_case_cards (
     cumulative_summary_for_embedding TEXT,
     day_delta_embedding BLOB,
     cumulative_embedding BLOB,
-    extractor_version VARCHAR(64) DEFAULT 'day-v2.2-etiology-chain',
+    case_card_embedding BLOB,
+    extractor_version VARCHAR(64) DEFAULT 'day-v3.0-case-card-embedding',
     embedding_model VARCHAR(128) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -52,7 +53,7 @@ CREATE TABLE IF NOT EXISTS record_day_case_cards (
 """
 
 
-DEFAULT_DAY_EXTRACTOR_VERSION = "day-v2.2-etiology-chain"
+DEFAULT_DAY_EXTRACTOR_VERSION = "day-v3.0-case-card-embedding"
 
 
 class MySQLDayStore:
@@ -122,27 +123,19 @@ class MySQLDayStore:
                         patient_id: str,
                         day_index: int,
                         card: dict,
-                        day_delta_embedding: Optional[np.ndarray],
-                        cumulative_embedding: Optional[np.ndarray],
+                        case_card_embedding: Optional[np.ndarray] = None,
                         extractor_version: str = DEFAULT_DAY_EXTRACTOR_VERSION,
                         embedding_model: str = "") -> None:
         card_json = json.dumps(card, ensure_ascii=False)
-        day_summary = card.get("day_summary_for_embedding") or card.get("summary_for_embedding", "")
-        cumulative_summary = card.get("cumulative_summary_for_embedding") or card.get("summary_for_embedding", "")
-        day_blob = day_delta_embedding.astype(np.float32).tobytes() if day_delta_embedding is not None else None
-        cumulative_blob = cumulative_embedding.astype(np.float32).tobytes() if cumulative_embedding is not None else None
+        case_card_blob = case_card_embedding.astype(np.float32).tobytes() if case_card_embedding is not None else None
 
         sql = """INSERT INTO record_day_case_cards
                  (day_record_id, patient_id, day_index, case_card_json,
-                  day_summary_for_embedding, cumulative_summary_for_embedding,
-                  day_delta_embedding, cumulative_embedding, extractor_version, embedding_model)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  case_card_embedding, extractor_version, embedding_model)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                  ON DUPLICATE KEY UPDATE
                   case_card_json = VALUES(case_card_json),
-                  day_summary_for_embedding = VALUES(day_summary_for_embedding),
-                  cumulative_summary_for_embedding = VALUES(cumulative_summary_for_embedding),
-                  day_delta_embedding = VALUES(day_delta_embedding),
-                  cumulative_embedding = VALUES(cumulative_embedding),
+                  case_card_embedding = VALUES(case_card_embedding),
                   extractor_version = VALUES(extractor_version),
                   embedding_model = VALUES(embedding_model)"""
 
@@ -151,7 +144,7 @@ class MySQLDayStore:
             with conn.cursor() as cursor:
                 cursor.execute(sql, (
                     day_record_id, patient_id, day_index, card_json,
-                    day_summary, cumulative_summary, day_blob, cumulative_blob,
+                    case_card_blob,
                     extractor_version, embedding_model,
                 ))
             conn.commit()
@@ -292,7 +285,7 @@ class MySQLDayStore:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """SELECT day_record_id, patient_id, day_index, case_card_json,
-                              day_delta_embedding, cumulative_embedding
+                              day_delta_embedding, cumulative_embedding, case_card_embedding
                        FROM record_day_case_cards
                        WHERE extractor_version = %s
                        ORDER BY patient_id, day_index""",
@@ -308,6 +301,7 @@ class MySQLDayStore:
             card = json.loads(card_json) if isinstance(card_json, str) else card_json
             day_blob = row.get("day_delta_embedding")
             cumulative_blob = row.get("cumulative_embedding")
+            case_card_blob = row.get("case_card_embedding")
             item = {
                 "day_record_id": row["day_record_id"],
                 "patient_id": row["patient_id"],
@@ -315,6 +309,7 @@ class MySQLDayStore:
                 "case_card": card,
                 "day_delta_embedding": np.frombuffer(day_blob, dtype=np.float32) if day_blob else None,
                 "cumulative_embedding": np.frombuffer(cumulative_blob, dtype=np.float32) if cumulative_blob else None,
+                "case_card_embedding": np.frombuffer(case_card_blob, dtype=np.float32) if case_card_blob else None,
             }
             result.setdefault(row["patient_id"], []).append(item)
         return result
@@ -331,7 +326,7 @@ class MySQLDayStore:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """SELECT COUNT(*) AS cnt FROM record_day_case_cards
-                       WHERE day_delta_embedding IS NOT NULL OR cumulative_embedding IS NOT NULL"""
+                       WHERE case_card_embedding IS NOT NULL"""
                 )
                 row = cursor.fetchone()
                 return row["cnt"] if row else 0

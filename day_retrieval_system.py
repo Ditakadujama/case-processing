@@ -8,6 +8,7 @@ import re
 
 import numpy as np
 
+from case_card_embedding import build_case_card_embedding_text
 from clinical_text_filter import ClinicalDayRecord, build_clinical_day_records
 from config import DBConfig, EmbeddingConfig, LLMConfig, RerankerConfig
 from day_store import DEFAULT_DAY_EXTRACTOR_VERSION, MySQLDayStore
@@ -410,6 +411,7 @@ class DayLevelRetrievalSystem:
             for item in cards:
                 item["day_delta_embedding"] = _normalize_embedding(item.get("day_delta_embedding"))
                 item["cumulative_embedding"] = _normalize_embedding(item.get("cumulative_embedding"))
+                item["case_card_embedding"] = _normalize_embedding(item.get("case_card_embedding"))
 
     def build_query_days(self, query_rows: Iterable[dict], max_days: int = 0) -> Dict[str, List[dict]]:
         records = build_clinical_day_records(query_rows, max_days=max_days)
@@ -422,15 +424,13 @@ class DayLevelRetrievalSystem:
             items = []
             for day in patient_days:
                 card = self._extract_query_day_card(day)
-                day_embedding = None
-                cumulative_embedding = None
+                case_card_embedding = None
                 if card and self.emb_service.is_available:
-                    day_summary = card.get("day_summary_for_embedding") or card.get("summary_for_embedding", "")
-                    cumulative_summary = card.get("cumulative_summary_for_embedding") or ""
-                    if day_summary:
-                        day_embedding = _normalize_embedding(self.emb_service.embed_text(day_summary))
-                    if cumulative_summary:
-                        cumulative_embedding = _normalize_embedding(self.emb_service.embed_text(cumulative_summary))
+                    embedding_text = build_case_card_embedding_text(card)
+                    if embedding_text:
+                        case_card_embedding = _normalize_embedding(
+                            self.emb_service.embed_text(embedding_text)
+                        )
 
                 items.append({
                     "day_record_id": day.day_record_id,
@@ -440,8 +440,7 @@ class DayLevelRetrievalSystem:
                     "day_text": day.day_text,
                     "cumulative_text": day.cumulative_text,
                     "case_card": card,
-                    "day_delta_embedding": day_embedding,
-                    "cumulative_embedding": cumulative_embedding,
+                    "case_card_embedding": case_card_embedding,
                     "text_vector": _char_ngram_vector(day.day_text),
                     "trajectory_state": (card or {}).get("clinical_state", ""),
                 })
@@ -534,29 +533,29 @@ class DayLevelRetrievalSystem:
 
     def _day_pair_similarity(self, query_day: dict, cand_day: dict) -> Optional[float]:
         parts = []
+
+        case_card_emb = _vector_cosine(
+            query_day.get("case_card_embedding"),
+            cand_day.get("case_card_embedding"),
+        )
+        if case_card_emb is not None:
+            parts.append((0.45, max(0.0, case_card_emb)))
+
         etiology_sim = _etiology_chain_similarity(query_day.get("case_card"), cand_day.get("case_card"))
         if etiology_sim is not None:
-            parts.append((0.35, etiology_sim))
+            parts.append((0.25, etiology_sim))
 
         diagnosis_sim = _diagnosis_axis_similarity(query_day.get("case_card"), cand_day.get("case_card"))
         if diagnosis_sim is not None:
-            parts.append((0.20, diagnosis_sim))
-
-        day_emb = _vector_cosine(query_day.get("day_delta_embedding"), cand_day.get("day_delta_embedding"))
-        if day_emb is not None:
-            parts.append((0.30, max(0.0, day_emb)))
+            parts.append((0.15, diagnosis_sim))
 
         tag_sim = _jaccard(_day_card_tags(query_day.get("case_card")), _day_card_tags(cand_day.get("case_card")))
         if tag_sim is not None:
-            parts.append((0.15, tag_sim))
-
-        cumulative_emb = _vector_cosine(query_day.get("cumulative_embedding"), cand_day.get("cumulative_embedding"))
-        if cumulative_emb is not None:
-            parts.append((0.10, max(0.0, cumulative_emb)))
+            parts.append((0.08, tag_sim))
 
         text_sim = _counter_cosine(query_day.get("text_vector"), cand_day.get("text_vector"))
         if text_sim is not None:
-            parts.append((0.08, text_sim))
+            parts.append((0.07, text_sim))
 
         if not parts:
             return None
