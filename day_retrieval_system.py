@@ -2,19 +2,50 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from typing import Dict, Iterable, List, Optional, Tuple
+import logging
 import re
+from collections import Counter, OrderedDict
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from candidate_retriever import (
+    InMemoryVectorCandidateRetriever,
+    LegacyFullScanCandidateRetriever,
+)
 from case_card_embedding import build_case_card_embedding_text
 from clinical_text_filter import ClinicalDayRecord, build_clinical_day_records
-from config import DBConfig, EmbeddingConfig, LLMConfig, RerankerConfig
+from config import DBConfig, EmbeddingConfig, LLMConfig, RerankerConfig, RetrievalConfig
 from day_store import DEFAULT_DAY_EXTRACTOR_VERSION, MySQLDayStore
 from embedding_index import EmbeddingService
 from llm_case_extractor import LLMCaseExtractor
 from llm_reranker import HTTPReranker, LLMReranker
+
+logger = logging.getLogger(__name__)
+
+
+class LRUCache:
+    """有界 LRU 缓存，用于 n-gram 向量缓存。"""
+
+    def __init__(self, capacity: int = 10000):
+        self.capacity = capacity
+        self._cache: OrderedDict = OrderedDict()
+
+    def get(self, key: str):
+        if key not in self._cache:
+            return None
+        self._cache.move_to_end(key)
+        return self._cache[key]
+
+    def set(self, key: str, value) -> None:
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = value
+        if len(self._cache) > self.capacity:
+            self._cache.popitem(last=False)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._cache
 
 
 def _vector_cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
@@ -380,7 +411,10 @@ def _jaccard(a: set, b: set) -> Optional[float]:
 
 
 class DayLevelRetrievalSystem:
-    """按患者每日记录序列进行相似度检索。"""
+    """按患者每日记录序列进行相似度检索。
+
+    Stage 5: 使用 CandidateRetriever 进行候选预筛，仅对候选患者执行完整医学精算。
+    """
 
     def __init__(self, db_config: DBConfig):
         self.db_config = db_config
@@ -390,48 +424,80 @@ class DayLevelRetrievalSystem:
         self.http_reranker = HTTPReranker(RerankerConfig())
         self.llm_reranker = LLMReranker(LLMConfig())
         self.emb_service = EmbeddingService(EmbeddingConfig())
+        self.retrieval_config = RetrievalConfig()
+
+        # Stage 5: lazy-loaded data (initially empty)
         self._day_records_by_patient: Dict[str, List[dict]] = {}
         self._day_cards_by_patient: Dict[str, List[dict]] = {}
-        self._load_index()
+        self._ngram_cache: "LRUCache" = LRUCache(capacity=20000)
+
+        # Stage 5: build candidate retriever
+        retrieval_backend = self.retrieval_config.backend
+        if retrieval_backend == "legacy_full_scan":
+            self._retriever = LegacyFullScanCandidateRetriever(self.day_store)
+        elif retrieval_backend == "in_memory_vector":
+            self._retriever = InMemoryVectorCandidateRetriever(
+                self.day_store,
+                extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
+                embedding_model=self.emb_service.config.model,
+            )
+        else:
+            raise ValueError(f"未知 RETRIEVAL_BACKEND: {retrieval_backend}")
+
+        # Stage 5: load only the lightweight retriever index
+        self._retriever.load_index()
 
     @property
     def patient_count(self) -> int:
-        return len(self._day_records_by_patient)
+        return self.day_store.count_patients()
 
     @property
     def day_count(self) -> int:
-        return sum(len(v) for v in self._day_records_by_patient.values())
+        return sum(len(v) for v in self._day_records_by_patient.values()) or self.day_store.count_days()
 
-    def _load_index(self) -> None:
-        self._day_records_by_patient = self.day_store.load_days_by_patient()
-        self._day_cards_by_patient = self.day_store.load_day_cards_by_patient(
-            extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION
+    def _ensure_candidates_loaded(self, patient_ids: List[str]) -> None:
+        """懒加载候选患者的完整数据（day_text + 病例卡 + embedding）。
+
+        只加载尚未在内存中的患者，避免重复查询。
+        """
+        missing = [pid for pid in patient_ids if pid not in self._day_records_by_patient]
+        if not missing:
+            return
+
+        new_days = self.day_store.load_days_for_patients(missing)
+        new_cards = self.day_store.load_day_cards_for_patients(
+            missing, extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION
         )
-        for cards in self._day_cards_by_patient.values():
+
+        # Normalize embeddings
+        for cards in new_cards.values():
             for item in cards:
                 item["day_delta_embedding"] = _normalize_embedding(item.get("day_delta_embedding"))
                 item["cumulative_embedding"] = _normalize_embedding(item.get("cumulative_embedding"))
                 item["case_card_embedding"] = _normalize_embedding(item.get("case_card_embedding"))
 
+        self._day_records_by_patient.update(new_days)
+        self._day_cards_by_patient.update(new_cards)
+
     def build_query_days(self, query_rows: Iterable[dict], max_days: int = 0) -> Dict[str, List[dict]]:
-        records = build_clinical_day_records(query_rows, max_days=max_days)
+        records = build_clinical_day_records(
+            query_rows,
+            max_days=max_days,
+            source_table="query",
+            history_mode=self.llm_extractor.config.history_mode,
+            history_window_days=self.llm_extractor.config.history_window_days,
+            history_max_chars=self.llm_extractor.config.history_max_chars,
+        )
         by_patient: Dict[str, List[ClinicalDayRecord]] = {}
         for record in records:
             by_patient.setdefault(record.patient_id, []).append(record)
 
         result: Dict[str, List[dict]] = {}
+        # Phase 1: LLM extraction for all days
         for patient_id, patient_days in by_patient.items():
             items = []
             for day in patient_days:
                 card = self._extract_query_day_card(day)
-                case_card_embedding = None
-                if card and self.emb_service.is_available:
-                    embedding_text = build_case_card_embedding_text(card)
-                    if embedding_text:
-                        case_card_embedding = _normalize_embedding(
-                            self.emb_service.embed_text(embedding_text)
-                        )
-
                 items.append({
                     "day_record_id": day.day_record_id,
                     "patient_id": day.patient_id,
@@ -440,11 +506,33 @@ class DayLevelRetrievalSystem:
                     "day_text": day.day_text,
                     "cumulative_text": day.cumulative_text,
                     "case_card": card,
-                    "case_card_embedding": case_card_embedding,
+                    "case_card_embedding": None,
                     "text_vector": _char_ngram_vector(day.day_text),
                     "trajectory_state": (card or {}).get("clinical_state", ""),
                 })
             result[patient_id] = items
+
+        # Stage 4: Phase 2 — collect all embedding texts and batch embed once
+        embedding_map: list[tuple[str, int, str]] = []  # (patient_id, day_idx, text)
+        for patient_id, items in result.items():
+            for i, item in enumerate(items):
+                card = item.get("case_card")
+                if card and self.emb_service.is_available:
+                    embedding_text = build_case_card_embedding_text(card)
+                    if embedding_text:
+                        embedding_map.append((patient_id, i, embedding_text))
+
+        if embedding_map:
+            texts = [t for _, _, t in embedding_map]
+            batch_result = self.emb_service.embed_batch(texts)
+            for idx, (patient_id, day_idx, _) in enumerate(embedding_map):
+                vec = batch_result.vectors[idx]
+                if vec is not None:
+                    result[patient_id][day_idx]["case_card_embedding"] = _normalize_embedding(vec)
+                elif batch_result.errors:
+                    logger.warning("Query embedding failed for %s day %d: %s",
+                                   patient_id, day_idx, batch_result.errors.get(idx, "unknown"))
+
         return result
 
     def search(self, query_days: List[dict], top_k: int = 5,
@@ -454,10 +542,45 @@ class DayLevelRetrievalSystem:
                rerank_interval: float = 0.0,
                candidate_pool_size: int = 30) -> List[dict]:
         exclude_patient_ids = exclude_patient_ids or set()
+
+        # Stage 5: Phase 1 — candidate retrieval (lightweight)
+        patient_limit = self.retrieval_config.patient_candidates
+        fallback_reason: str = ""
+        try:
+            candidate_patient_ids = self._retriever.retrieve_patient_ids(
+                query_days,
+                patient_limit=patient_limit,
+                day_limit_per_query=self.retrieval_config.day_candidates_per_query,
+            )
+            # Exclude query patient
+            candidate_patient_ids = [
+                pid for pid in candidate_patient_ids
+                if pid not in exclude_patient_ids
+            ]
+        except Exception as e:
+            if not self.retrieval_config.fallback_to_full_scan:
+                raise
+            logger.warning("Candidate retriever failed, falling back to full scan: %s", e)
+            fallback_reason = str(e)
+            candidate_patient_ids = self.day_store.list_all_patient_ids()
+            candidate_patient_ids = [
+                pid for pid in candidate_patient_ids
+                if pid not in exclude_patient_ids
+            ]
+
+        logger.info(
+            "retrieval_backend=%s candidate_patients=%d fallback_reason=%s",
+            self._retriever.backend_name,
+            len(candidate_patient_ids),
+            fallback_reason or "none",
+        )
+
+        # Stage 5: Phase 2 — lazy load only candidates
+        self._ensure_candidates_loaded(candidate_patient_ids)
+
+        # Stage 5: Phase 3 — full medical scoring only on candidates
         candidates = []
-        for patient_id in self._day_records_by_patient:
-            if patient_id in exclude_patient_ids:
-                continue
+        for patient_id in candidate_patient_ids:
             score, details, trajectory_score, stats = self._daily_patient_similarity(
                 query_days, patient_id, max_days=max_days
             )
@@ -523,7 +646,16 @@ class DayLevelRetrievalSystem:
             card_item = day_cards.get(day["day_record_id"])
             if card_item:
                 merged.update(card_item)
-            merged["text_vector"] = _char_ngram_vector(merged.get("day_text", ""))
+
+            # Stage 5: n-gram cache — key includes record ID to avoid stale hits
+            cache_key = f"{day['day_record_id']}:{merged.get('source_hash', '')}"
+            if cache_key not in self._ngram_cache:
+                self._ngram_cache.set(
+                    cache_key,
+                    _char_ngram_vector(merged.get("day_text", "")),
+                )
+            merged["text_vector"] = self._ngram_cache.get(cache_key)
+
             merged["trajectory_state"] = (
                 (merged.get("case_card") or {}).get("clinical_state")
                 or merged.get("trajectory_state", "")

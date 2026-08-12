@@ -3,15 +3,30 @@ Embedding 服务 — 调用 OpenAI-compatible embeddings API，
 生成病例卡摘要的语义向量并计算余弦相似度。
 """
 
+from __future__ import annotations
+
+import logging
 import os
 import time
-import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EmbeddingBatchResult:
+    """批量 embedding 的结构化返回结果。
+
+    每个输入文本对应 vectors 列表中的一个元素。
+    失败的项在 vectors 中为 None，对应的错误信息在 errors 字典中。
+    """
+    vectors: list  # list[np.ndarray | None]
+    errors: dict  # dict[int, str]  — 索引 -> 错误描述
+    model: str = ""
+    dimension: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -98,80 +113,132 @@ class EmbeddingService:
         """返回 embedding 向量维度（首次调用后确定）"""
         return self._dimension
 
+    @property
+    def _http_client(self):
+        """Lazily create the shared httpx client."""
+        if not hasattr(self, "_http"):
+            from http_client import HTTPClient
+            connect_timeout = getattr(self.config, "connect_timeout", 10)
+            max_connections = getattr(self.config, "max_connections", 10)
+            self._http = HTTPClient(
+                base_url=self.config.api_base,
+                api_key=self.config.api_key,
+                connect_timeout=connect_timeout,
+                read_timeout=self.config.timeout,
+                max_connections=max_connections,
+                max_retries=self.config.max_retries,
+            )
+        return self._http
+
     def embed_text(self, text: str) -> np.ndarray:
         """
         生成单条文本的 embedding 向量。
 
         Args:
-            text: 输入文本（病例卡 summary_for_embedding）
+            text: 输入文本
 
         Returns:
             float32 numpy array, shape (D,)
         """
-        vectors = self.embed_batch([text], batch_size=1)
-        return vectors[0]
+        result = self.embed_batch([text])
+        if result.errors:
+            raise RuntimeError(f"Embedding 失败: {result.errors.get(0, 'unknown')}")
+        vec = result.vectors[0]
+        if vec is None:
+            raise RuntimeError("Embedding 返回空向量")
+        return vec
 
-    def embed_batch(self, texts: List[str], batch_size: int = 20) -> np.ndarray:
-        """
-        批量生成 embedding 向量。
+    def embed_batch(self, texts: List[str], batch_size: int = 0) -> EmbeddingBatchResult:
+        """批量生成 embedding 向量，返回结构化结果。
 
         Args:
             texts: 输入文本列表
-            batch_size: 每批发送的文本数
+            batch_size: 每批发送的文本数（0=使用配置默认值）
 
         Returns:
-            2-D float32 numpy array, shape (len(texts), D)
+            EmbeddingBatchResult，包含 vectors、errors、model、dimension
         """
-        import urllib.request
-        import json as _json
-
         if not self.is_available:
             raise RuntimeError("Embedding 服务未配置，请设置 EMBEDDING_API_BASE 和 EMBEDDING_API_KEY 环境变量")
 
-        all_vectors = []
-        url = f"{self.config.api_base.rstrip('/')}/embeddings"
+        if batch_size <= 0:
+            batch_size = getattr(self.config, "batch_size", 32)
+
+        vectors: list = [None] * len(texts)
+        errors: dict[int, str] = {}
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            payload = _json.dumps({
-                "model": self.config.model,
-                "input": batch,
-            }).encode("utf-8")
+            try:
+                body = self._http_client.post_json("embeddings", {
+                    "model": self.config.model,
+                    "input": batch,
+                })
+                data_list = body.get("data", [])
 
-            for attempt in range(self.config.max_retries):
-                try:
-                    req = urllib.request.Request(url, data=payload, method="POST")
-                    req.add_header("Content-Type", "application/json")
-                    req.add_header("Authorization", f"Bearer {self.config.api_key}")
+                # Strict validation: length must match
+                if len(data_list) != len(batch):
+                    raise ValueError(
+                        f"Embedding 服务返回 {len(data_list)} 个向量，"
+                        f"期望 {len(batch)} 个"
+                    )
 
-                    with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
-                        body = _json.loads(resp.read().decode("utf-8"))
+                # Validate indices and vector quality
+                returned_indices: set[int] = set()
+                for item in data_list:
+                    idx = item.get("index")
+                    emb = item.get("embedding")
+                    if idx is None or emb is None:
+                        raise ValueError("Embedding 响应缺少 index 或 embedding")
+                    if idx in returned_indices:
+                        raise ValueError(f"Embedding 响应中有重复 index: {idx}")
+                    returned_indices.add(idx)
 
-                    data_list = body.get("data", [])
-                    data_list.sort(key=lambda x: x.get("index", 0))
-                    batch_vectors = [np.array(item["embedding"], dtype=np.float32) for item in data_list]
+                    arr = np.array(emb, dtype=np.float32)
 
-                    if self._dimension is None and batch_vectors:
-                        self._dimension = len(batch_vectors[0])
+                    # NaN / Inf check
+                    if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+                        raise ValueError(f"Embedding 向量在 index {idx} 包含 NaN 或 Inf")
+
+                    # Zero vector check
+                    if np.all(arr == 0):
+                        raise ValueError(f"Embedding 向量在 index {idx} 为零向量")
+
+                    # Dimension tracking
+                    if self._dimension is None:
+                        self._dimension = len(arr)
                         logger.info(f"Embedding 维度: {self._dimension}")
+                    elif len(arr) != self._dimension:
+                        raise ValueError(
+                            f"Embedding 维度不匹配: 期望 {self._dimension}，"
+                            f"实际 {len(arr)} (index {idx})"
+                        )
 
-                    all_vectors.extend(batch_vectors)
-                    self._request_count += 1
-                    break
+                    vectors[i + idx] = arr
 
-                except Exception as e:
-                    logger.warning(f"Embedding 请求失败 (attempt {attempt+1}/{self.config.max_retries}): {e}")
-                    if attempt < self.config.max_retries - 1:
-                        time.sleep(2 ** attempt)
-                    else:
-                        self._error_count += 1
-                        raise RuntimeError(f"Embedding 请求失败（已重试{self.config.max_retries}次）: {e}")
+                self._request_count += 1
 
-            # 批次间短暂等待，避免触发限流
-            if i + batch_size < len(texts):
-                time.sleep(0.1)
+            except Exception as e:
+                logger.warning(f"Embedding 批次请求失败 (offset={i}, size={len(batch)}): {e}")
+                # Split retry: if batch has multiple items, try one-by-one
+                if len(batch) > 1:
+                    for j, text in enumerate(batch):
+                        try:
+                            vec = self.embed_text(text)
+                            vectors[i + j] = vec
+                        except Exception as inner_e:
+                            errors[i + j] = str(inner_e)
+                else:
+                    errors[i] = str(e)
 
-        return np.array(all_vectors, dtype=np.float32)
+        self._error_count += len(errors)
+
+        return EmbeddingBatchResult(
+            vectors=vectors,
+            errors=errors,
+            model=self.config.model,
+            dimension=self._dimension or 0,
+        )
 
     def get_stats(self) -> dict:
         """返回服务统计信息"""
@@ -182,3 +249,8 @@ class EmbeddingService:
             "error_count": self._error_count,
             "model": self.config.model,
         }
+
+    def close(self) -> None:
+        client = getattr(self, "_http", None)
+        if client is not None:
+            client.close()

@@ -3,11 +3,15 @@ MySQL 数据库访问模块
 提供病历数据的读取、写入和迁移功能
 """
 
+from __future__ import annotations
+
+import logging
 import os
 import sys
-import logging
+import threading
+import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
 
 # 将项目根目录加入 sys.path，确保 data_migrate/ 子目录中也能导入项目根目录的 config 模块
@@ -28,6 +32,50 @@ logger = logging.getLogger(__name__)
 from config import DBConfig  # noqa: F401  # 向后兼容，新代码请用 from config import DBConfig
 
 
+_POOLS: dict[tuple, Any] = {}
+_POOLS_LOCK = threading.Lock()
+
+
+def _pool_key(cfg: DBConfig) -> tuple:
+    return (
+        cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.charset,
+        cfg.pool_size, cfg.pool_max_overflow,
+    )
+
+
+def get_pooled_connection(cfg: DBConfig):
+    """从进程级有界连接池取得连接。
+
+    如果运行环境缺少 DBUtils，则记录告警并回退到直接连接，保证迁移脚本
+    和最小环境仍可运行；正式部署应安装 requirements.txt 中的 DBUtils。
+    """
+    try:
+        from dbutils.pooled_db import PooledDB
+    except ImportError:
+        kwargs = cfg.to_connection_kwargs()
+        kwargs.setdefault("cursorclass", DictCursor)
+        logger.warning("DBUtils 未安装，MySQL 连接池已降级为直接连接")
+        return pymysql.connect(**kwargs)
+
+    key = _pool_key(cfg)
+    with _POOLS_LOCK:
+        pool = _POOLS.get(key)
+        if pool is None:
+            kwargs = cfg.to_connection_kwargs()
+            kwargs.setdefault("cursorclass", DictCursor)
+            pool = PooledDB(
+                creator=pymysql,
+                maxconnections=max(1, cfg.pool_size + cfg.pool_max_overflow),
+                mincached=1,
+                maxcached=max(1, cfg.pool_size),
+                blocking=True,
+                ping=1,
+                **kwargs,
+            )
+            _POOLS[key] = pool
+    return pool.connection()
+
+
 @contextmanager
 def get_db_connection(cfg: DBConfig):
     """
@@ -41,9 +89,7 @@ def get_db_connection(cfg: DBConfig):
     """
     conn = None
     try:
-        kwargs = cfg.to_connection_kwargs()
-        kwargs.setdefault("cursorclass", DictCursor)
-        conn = pymysql.connect(**kwargs)
+        conn = get_pooled_connection(cfg)
         yield conn
     except pymysql.MySQLError as e:
         logger.error(f"数据库连接失败: {e}")
@@ -108,7 +154,17 @@ def init_database(cfg: DBConfig) -> None:
 
 
 def init_query_records_table(cfg: DBConfig) -> None:
-    """初始化检索病例临时表。"""
+    """初始化检索病例临时表。
+
+    .. deprecated::
+        默认搜索路径已改为 Excel → 内存，不再使用 query_records 表。
+        保留此函数用于兼容旧流程。
+    """
+    warnings.warn(
+        "init_query_records_table is deprecated. "
+        "Default search path now uses Excel → memory pipeline.",
+        DeprecationWarning, stacklevel=2,
+    )
     with get_db_connection(cfg) as conn:
         with conn.cursor() as cursor:
             cursor.execute(CREATE_QUERY_TABLE_SQL)
@@ -117,7 +173,17 @@ def init_query_records_table(cfg: DBConfig) -> None:
 
 
 def clear_query_records(cfg: DBConfig) -> None:
-    """清空检索病例临时表。"""
+    """清空检索病例临时表。
+
+    .. deprecated::
+        默认搜索路径不再执行 DELETE FROM query_records。
+        保留此函数用于兼容旧流程。
+    """
+    warnings.warn(
+        "clear_query_records is deprecated. "
+        "Default search path no longer touches query_records table.",
+        DeprecationWarning, stacklevel=2,
+    )
     init_query_records_table(cfg)
     with get_db_connection(cfg) as conn:
         with conn.cursor() as cursor:
@@ -325,3 +391,17 @@ def test_connection(cfg: DBConfig) -> bool:
     except Exception as e:
         logger.error(f"数据库连接测试失败: {e}")
         return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 工具函数
+# ═══════════════════════════════════════════════════════════════════
+
+def chunked(values: list, size: int = 500) -> list[list]:
+    """将列表拆分为固定大小的块。
+
+    用于避免超长 SQL IN 子句或超过 max_allowed_packet。
+    """
+    if not values:
+        return []
+    return [values[i:i + size] for i in range(0, len(values), size)]

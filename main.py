@@ -7,6 +7,7 @@
 """
 
 import logging
+import json
 import os
 import sys
 import time
@@ -27,9 +28,17 @@ from data_migrate.database import (
     load_query_daily_rows,
 )
 from day_retrieval_system import DayLevelRetrievalSystem
-from day_store import DEFAULT_DAY_EXTRACTOR_VERSION, MySQLDayStore
+from day_store import (
+    DEFAULT_DAY_EXTRACTOR_VERSION,
+    DayCardWriteRow,
+    MySQLDayStore,
+    ProcessingFailure,
+    determine_required_action,
+)
 from embedding_index import EmbeddingService
 from llm_case_extractor import LLMCaseExtractor
+from query_loader import generate_request_id, load_xlsx_daily_rows
+from record_fingerprint import build_embedding_input_hash
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -102,7 +111,7 @@ def build_index(skip_existing: bool = True,
     day_store.init_tables()
     if rebuild_all:
         day_store.delete_all()
-        print("已清空 record_days 和 record_day_case_cards")
+        print("已清空 record_days、record_day_case_cards 和 record_day_processing_jobs")
     else:
         print(f"增量 build：当前 record_days={day_store.count_days()}，"
               f"record_day_case_cards={day_store.count_day_cards()}")
@@ -126,20 +135,54 @@ def build_index(skip_existing: bool = True,
         print("medical_records 中没有原始记录，请先迁移数据")
         return
 
-    day_records = build_clinical_day_records(rows)
-    before = len(day_records)
+    llm_extractor = LLMCaseExtractor(llm_cfg)
+    emb_service = EmbeddingService(emb_cfg)
+    day_records = build_clinical_day_records(
+        rows,
+        history_mode=llm_cfg.history_mode,
+        history_window_days=llm_cfg.history_window_days,
+        history_max_chars=llm_cfg.history_max_chars,
+    )
+    actions_by_id = {day.day_record_id: "extract_and_embed" for day in day_records}
     if skip_existing and not rebuild_all:
         all_ids = [day.day_record_id for day in day_records]
-        existing_day_set = day_store.existing_day_ids(all_ids)
-        existing_card_set = day_store.existing_day_card_ids(all_ids, DEFAULT_DAY_EXTRACTOR_VERSION)
-        day_records = [
-            day for day in day_records
-            if day.day_record_id not in existing_day_set
-            or day.day_record_id not in existing_card_set
-        ]
-        skipped = before - len(day_records)
-        if skipped:
-            print(f"跳过已存在同版本天级索引: {skipped} 天")
+        snapshots = day_store.load_processing_snapshots(all_ids)
+        existing_cards = day_store.load_case_cards_by_ids(all_ids)
+        embedding_model = emb_cfg.model
+        emb_dim = emb_service.dimension  # may be None on first run
+
+        filtered: list[tuple[ClinicalDayRecord, str]] = []
+        skipped_count = 0
+        for day in day_records:
+            existing_card = existing_cards.get(day.day_record_id)
+            existing_embedding_text = (
+                build_case_card_embedding_text(existing_card) if existing_card else ""
+            )
+            emb_hash = (
+                build_embedding_input_hash(existing_embedding_text)
+                if existing_embedding_text else ""
+            )
+            action = determine_required_action(
+                day_source_hash=day.source_hash,
+                day_extraction_input_hash=day.extraction_input_hash,
+                snapshot=snapshots.get(day.day_record_id),
+                extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
+                embedding_model=embedding_model,
+                embedding_input_hash=emb_hash,
+                expected_dimension=emb_dim,
+            )
+            if action == "skip":
+                skipped_count += 1
+            else:
+                filtered.append((day, action))
+                actions_by_id[day.day_record_id] = action
+        day_records = [d for d, _ in filtered]
+        if skipped_count:
+            print(f"跳过已存在同版本天级索引: {skipped_count} 天 "
+                  f"(病例卡+embedding均有效且输入未变)")
+        embed_only_days = [(d, a) for d, a in filtered if a == "embed_only"]
+        if embed_only_days:
+            print(f"仅需重做 embedding: {len(embed_only_days)} 天")
 
     if not day_records:
         print("没有需要新增 build 的天级记录。")
@@ -148,8 +191,6 @@ def build_index(skip_existing: bool = True,
     print(f"准备构建 {len(day_records)} 条天级记录，来自 {len(set(d.patient_id for d in day_records))} 个患者")
 
     batch_size = 200
-    llm_extractor = LLMCaseExtractor(llm_cfg)
-    emb_service = EmbeddingService(emb_cfg)
     for start in range(0, len(day_records), batch_size):
         batch = day_records[start:start + batch_size]
         _insert_day_texts(day_store, batch)
@@ -158,7 +199,7 @@ def build_index(skip_existing: bool = True,
             llm_extractor,
             emb_service,
             day_store,
-            skip_existing=skip_existing,
+            actions={day.day_record_id: actions_by_id[day.day_record_id] for day in batch},
             llm_workers=llm_workers,
             llm_interval=llm_interval,
         )
@@ -184,7 +225,11 @@ def _insert_day_texts(day_store: MySQLDayStore, day_records: list[ClinicalDayRec
             day.day_index,
             day.visit_date,
             day.day_text,
-            day.cumulative_text,
+            None,
+            day.source_table,
+            day.source_record_id,
+            day.source_hash,
+            day.extraction_input_hash,
         )
         for day in day_records
     ]
@@ -195,15 +240,15 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
                                   llm_extractor: LLMCaseExtractor,
                                   emb_service: EmbeddingService,
                                   day_store: MySQLDayStore,
-                                  skip_existing: bool,
+                                  actions: dict[str, str],
                                   llm_workers: int = 5,
                                   llm_interval: float = 1.0) -> None:
-    """批量抽取每日病例卡 + day/cumulative embedding。"""
+    """抽取病例卡后批量生成 embedding，并批量事务写入。"""
     if not day_records:
         return
 
     embedding_model = emb_service.config.model if emb_service else ""
-    stats = {"success": 0, "skip": 0, "fail": 0}
+    stats = {"success": 0, "fail": 0, "embed_only": 0}
     next_request_time = 0.0
     rate_lock = threading.Lock()
     min_interval = max(float(llm_interval), 0.0)
@@ -216,9 +261,7 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
                 time.sleep(next_request_time - now)
             next_request_time = time.time() + min_interval
 
-    def process_one(day: ClinicalDayRecord) -> str:
-        if skip_existing and day_store.day_card_exists(day.day_record_id, DEFAULT_DAY_EXTRACTOR_VERSION):
-            return "skip"
+    def extract_one(day: ClinicalDayRecord) -> tuple[ClinicalDayRecord, dict | None, str]:
         try:
             wait_rate_limit()
             card = llm_extractor.extract_day(
@@ -229,45 +272,135 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
                 visit_date=day.visit_date,
             )
             if not card:
-                logger.warning(f"[{day.day_record_id}] 天级病例卡抽取失败")
-                return "fail"
-
-            case_card_embedding = None
-            embedding_text = build_case_card_embedding_text(card)
-            try:
-                if embedding_text:
-                    case_card_embedding = emb_service.embed_text(embedding_text)
-            except Exception as e:
-                logger.warning(f"[{day.day_record_id}] case_card_embedding 生成失败: {e}")
-
-            day_store.insert_day_card(
-                day.day_record_id,
-                day.patient_id,
-                day.day_index,
-                card,
-                case_card_embedding=case_card_embedding,
-                extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
-                embedding_model=embedding_model,
-            )
-            return "success"
+                return day, None, "LLM 返回空病例卡"
+            return day, card, ""
         except Exception as e:
-            logger.error(f"[{day.day_record_id}] 天级病例卡处理异常: {e}")
-            return "fail"
+            return day, None, str(e)
 
-    total = len(day_records)
-    with ThreadPoolExecutor(max_workers=llm_workers) as executor:
-        futures = {executor.submit(process_one, day): day.day_record_id for day in day_records}
-        for future in as_completed(futures):
-            try:
-                status = future.result()
-            except Exception:
-                status = "fail"
-            stats[status] += 1
-            done = stats["success"] + stats["skip"] + stats["fail"]
-            print(f"\r  LLM 每日病例卡: [{done}/{total}] "
-                  f"(成功 {stats['success']}, 跳过 {stats['skip']}, 失败 {stats['fail']})",
-                  end="", flush=True)
-    print()
+    extract_days = [
+        day for day in day_records
+        if actions.get(day.day_record_id, "extract_and_embed") != "embed_only"
+    ]
+    embed_only_days = [
+        day for day in day_records
+        if actions.get(day.day_record_id) == "embed_only"
+    ]
+
+    cards_by_id: dict[str, dict] = {}
+    failures: list[ProcessingFailure] = []
+
+    if extract_days:
+        with ThreadPoolExecutor(max_workers=max(1, llm_workers)) as executor:
+            futures = {executor.submit(extract_one, day): day for day in extract_days}
+            for future in as_completed(futures):
+                day, card, error = future.result()
+                if card is not None:
+                    cards_by_id[day.day_record_id] = card
+                else:
+                    logger.warning("[%s] 天级病例卡抽取失败: %s", day.day_record_id, error)
+                    failures.append(ProcessingFailure(
+                        day_record_id=day.day_record_id,
+                        patient_id=day.patient_id,
+                        failed_stage="extracting",
+                        error=error,
+                        source_hash=day.source_hash,
+                        extraction_input_hash=day.extraction_input_hash,
+                        extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
+                        embedding_model=embedding_model,
+                    ))
+
+    if embed_only_days:
+        existing = day_store.load_case_cards_by_ids(
+            [day.day_record_id for day in embed_only_days]
+        )
+        for day in embed_only_days:
+            card = existing.get(day.day_record_id)
+            if card is None:
+                failures.append(ProcessingFailure(
+                    day_record_id=day.day_record_id,
+                    patient_id=day.patient_id,
+                    failed_stage="extracting",
+                    error="embed_only 路径未找到已有病例卡",
+                    source_hash=day.source_hash,
+                    extraction_input_hash=day.extraction_input_hash,
+                    extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
+                    embedding_model=embedding_model,
+                ))
+            else:
+                cards_by_id[day.day_record_id] = card
+                stats["embed_only"] += 1
+
+    day_by_id = {day.day_record_id: day for day in day_records}
+    prepared: list[tuple[ClinicalDayRecord, dict, str, str]] = []
+    for day_record_id, card in cards_by_id.items():
+        embedding_text = build_case_card_embedding_text(card)
+        if not embedding_text:
+            day = day_by_id[day_record_id]
+            prepared.append((day, card, "", ""))
+            continue
+        prepared.append((
+            day_by_id[day_record_id],
+            card,
+            embedding_text,
+            build_embedding_input_hash(embedding_text),
+        ))
+
+    embedding_texts = [item[2] for item in prepared if item[2]]
+    embedding_positions = [i for i, item in enumerate(prepared) if item[2]]
+    vectors_by_position: dict[int, object] = {}
+    embedding_errors: dict[int, str] = {}
+    if embedding_texts:
+        batch_result = emb_service.embed_batch(embedding_texts)
+        for batch_index, position in enumerate(embedding_positions):
+            vector = batch_result.vectors[batch_index]
+            if vector is not None:
+                vectors_by_position[position] = vector
+            else:
+                embedding_errors[position] = batch_result.errors.get(
+                    batch_index, "Embedding 返回空向量"
+                )
+
+    write_rows: list[DayCardWriteRow] = []
+    for position, (day, card, embedding_text, embedding_hash) in enumerate(prepared):
+        vector = vectors_by_position.get(position)
+        error = embedding_errors.get(position, "")
+        if not embedding_text:
+            error = "病例卡无法生成 embedding 输入"
+        success = vector is not None
+        write_rows.append(DayCardWriteRow(
+            day_record_id=day.day_record_id,
+            patient_id=day.patient_id,
+            day_index=day.day_index,
+            case_card_json=json.dumps(card, ensure_ascii=False),
+            case_card_embedding=(
+                vector.astype("float32").tobytes() if success else None
+            ),
+            source_hash=day.source_hash,
+            extraction_input_hash=day.extraction_input_hash,
+            embedding_input_hash=embedding_hash,
+            extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
+            embedding_model=embedding_model,
+            embedding_dimension=(int(vector.shape[0]) if success else None),
+            processing_status=("indexed" if success else "failed_retryable"),
+            failed_stage=("" if success else "embedding"),
+            last_error=error,
+        ))
+        if success:
+            stats["success"] += 1
+        else:
+            stats["fail"] += 1
+
+    write_result = day_store.upsert_day_cards(write_rows)
+    if write_result.fail_count:
+        stats["success"] = max(0, stats["success"] - write_result.fail_count)
+        stats["fail"] += write_result.fail_count
+    day_store.update_processing_failures(failures)
+    stats["fail"] += len(failures)
+
+    print(
+        f"  病例卡批处理: 成功 {stats['success']}, "
+        f"仅重做 embedding {stats['embed_only']}, 失败 {stats['fail']}"
+    )
 
 
 def search(search_excel: str,
@@ -275,19 +408,22 @@ def search(search_excel: str,
            rerank_top_n: int = 10,
            rerank_interval: float = 6.5,
            candidate_pool_size: int = 30) -> None:
-    """从查询 Excel 检索相似患者。"""
+    """从查询 Excel 检索相似患者（直接读取 Excel，不落库）。"""
     print("=" * 60)
     print("天级相似病例检索")
     print("=" * 60)
 
-    cfg = DBConfig.from_env()
-    try:
-        import_query_excel_to_db(cfg, search_excel)
-    except Exception as e:
-        print(f"导入查询 Excel 失败: {e}")
-        return
+    request_id = generate_request_id()
+    print(f"请求 ID: {request_id}")
 
-    query_rows = load_query_daily_rows(cfg)
+    cfg = DBConfig.from_env()
+
+    # Stage 2: Load directly from Excel, bypassing query_records table
+    try:
+        query_rows = load_xlsx_daily_rows(search_excel)
+    except Exception as e:
+        print(f"读取查询 Excel 失败: {e}")
+        return
     if not query_rows:
         print("查询 Excel 中没有有效病例")
         return
@@ -303,7 +439,7 @@ def search(search_excel: str,
         print("查询病例过滤后没有可用于相似度的医生关注文本")
         return
 
-    result_dir = "data/results"
+    result_dir = f"data/results/{request_id}"
     os.makedirs(result_dir, exist_ok=True)
     all_result_count = 0
 
@@ -337,20 +473,36 @@ def search(search_excel: str,
                       f"{result.get('rerank', {}).get('reason', '')[:80]}")
             print(f"      天级对齐: {result.get('daily_match_details', [])[:5]}")
 
-        _write_query_result_file(result_dir, search_excel, query_patient_id, query_days, results)
+        _write_query_result_file(result_dir, request_id, search_excel,
+                                 query_patient_id, query_days, results,
+                                 extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION)
 
     print(f"\n检索结果已保存到: {result_dir}/")
     print(f"共 {len(query_days_by_patient)} 个查询患者，{all_result_count} 条结果")
     print("=" * 60)
 
 
-def _write_query_result_file(result_dir: str, search_excel: str, query_patient_id: str,
-                             query_days: List[dict], results: List[dict]) -> None:
+def _write_query_result_file(result_dir: str, request_id: str, search_excel: str,
+                             query_patient_id: str,
+                             query_days: List[dict], results: List[dict],
+                             extractor_version: str = "",
+                             embedding_model: str = "",
+                             reranker_model: str = "") -> None:
+    from datetime import datetime
+
     output_file = os.path.join(result_dir, f"{safe_result_name(query_patient_id)}_结果.txt")
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(f"查询病例: {query_patient_id}\n")
+        f.write(f"请求 ID: {request_id}\n")
         f.write(f"查询来源: {search_excel}\n")
+        f.write(f"查询时间: {datetime.now().isoformat()}\n")
         f.write(f"查询天数: {len(query_days)}\n")
+        if extractor_version:
+            f.write(f"抽取器版本: {extractor_version}\n")
+        if embedding_model:
+            f.write(f"Embedding 模型: {embedding_model}\n")
+        if reranker_model:
+            f.write(f"Reranker 模型: {reranker_model}\n")
         f.write("=" * 80 + "\n\n")
         f.write("【查询病例医生关注文本】\n")
         for day in query_days:
@@ -398,7 +550,7 @@ def main() -> None:
     parser.add_argument("--build", action="store_true", default=False,
                         help="构建/增量更新医生关注文本天级索引")
     parser.add_argument("--search", default="", metavar="EXCEL",
-                        help="查询 Excel 路径；每次检索前清空 query_records，并导入该 Excel")
+                        help="查询 Excel 路径；查询数据直接在内存处理，不写入 query_records")
     parser.add_argument("--workers", "-j", type=int, default=1,
                         help="兼容旧参数；当前天级 build 不再使用多进程解析")
     parser.add_argument("--skip-existing-case-cards", action="store_true", default=False,

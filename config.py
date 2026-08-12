@@ -78,6 +78,13 @@ class DBConfig:
     password: str = ""
     database: str = "medical_records"
     charset: str = "utf8mb4"
+    # Stage 3: connection pooling
+    pool_size: int = field(default_factory=lambda: int(os.getenv("DB_POOL_SIZE", "5")))
+    pool_max_overflow: int = field(default_factory=lambda: int(os.getenv("DB_POOL_MAX_OVERFLOW", "5")))
+    connect_timeout: int = field(default_factory=lambda: int(os.getenv("DB_CONNECT_TIMEOUT", "10")))
+    read_timeout: int = field(default_factory=lambda: int(os.getenv("DB_READ_TIMEOUT", "60")))
+    write_timeout: int = field(default_factory=lambda: int(os.getenv("DB_WRITE_TIMEOUT", "60")))
+    batch_size: int = field(default_factory=lambda: int(os.getenv("DB_BATCH_SIZE", "200")))
 
     @classmethod
     def from_env(cls) -> "DBConfig":
@@ -100,6 +107,9 @@ class DBConfig:
             "password": self.password,
             "database": self.database,
             "charset": self.charset,
+            "connect_timeout": self.connect_timeout,
+            "read_timeout": self.read_timeout,
+            "write_timeout": self.write_timeout,
         }
 
 
@@ -122,10 +132,25 @@ class LLMConfig:
     save_failed_raw: bool = field(default_factory=lambda: os.environ.get("LLM_SAVE_FAILED_RAW", "1") != "0")
     failed_raw_dir: str = field(default_factory=lambda: os.environ.get("LLM_FAILED_RAW_DIR", "data/llm_failures"))
     response_format_json: bool = field(default_factory=lambda: os.environ.get("LLM_RESPONSE_FORMAT_JSON", "0") == "1")
+    # Stage 6: history context
+    history_mode: str = field(default_factory=lambda: os.environ.get("LLM_HISTORY_MODE", "window"))
+    history_window_days: int = field(default_factory=lambda: int(os.environ.get("LLM_HISTORY_WINDOW_DAYS", "7")))
+    history_max_chars: int = field(default_factory=lambda: int(os.environ.get("LLM_HISTORY_MAX_CHARS", "30000")))
 
     @property
     def is_configured(self) -> bool:
         return bool(self.api_base and self.api_key)
+
+    def __post_init__(self):
+        valid_modes = {"all", "window"}
+        if self.history_mode not in valid_modes:
+            raise ValueError(
+                f"LLM_HISTORY_MODE 必须是 {valid_modes} 之一，当前值: '{self.history_mode}'"
+            )
+        if self.history_window_days < 1:
+            raise ValueError("LLM_HISTORY_WINDOW_DAYS 必须 >= 1")
+        if self.history_max_chars < 1000:
+            raise ValueError("LLM_HISTORY_MAX_CHARS 必须 >= 1000")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -140,10 +165,40 @@ class EmbeddingConfig:
     model: str = field(default_factory=lambda: os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"))
     timeout: int = field(default_factory=lambda: int(os.environ.get("EMBEDDING_TIMEOUT", "60")))
     max_retries: int = field(default_factory=lambda: int(os.environ.get("EMBEDDING_MAX_RETRIES", "3")))
+    # Stage 4: batch embedding
+    batch_size: int = field(default_factory=lambda: int(os.environ.get("EMBEDDING_BATCH_SIZE", "32")))
+    connect_timeout: int = field(default_factory=lambda: int(os.environ.get("EMBEDDING_CONNECT_TIMEOUT", "10")))
+    max_connections: int = field(default_factory=lambda: int(os.environ.get("EMBEDDING_MAX_CONNECTIONS", "10")))
 
     @property
     def is_configured(self) -> bool:
         return bool(self.api_base and self.api_key)
+
+
+@dataclass
+class RetrievalConfig:
+    """本地候选预筛配置。"""
+
+    backend: str = field(default_factory=lambda: os.environ.get(
+        "RETRIEVAL_BACKEND", "in_memory_vector"
+    ))
+    patient_candidates: int = field(default_factory=lambda: int(os.environ.get(
+        "RETRIEVAL_PATIENT_CANDIDATES", "200"
+    )))
+    day_candidates_per_query: int = field(default_factory=lambda: int(os.environ.get(
+        "RETRIEVAL_DAY_CANDIDATES_PER_QUERY_DAY", "300"
+    )))
+    fallback_to_full_scan: bool = field(default_factory=lambda: os.environ.get(
+        "RETRIEVAL_FALLBACK_TO_FULL_SCAN", "1"
+    ) != "0")
+
+    def __post_init__(self):
+        if self.backend not in {"in_memory_vector", "legacy_full_scan"}:
+            raise ValueError(f"未知 RETRIEVAL_BACKEND: {self.backend}")
+        if self.patient_candidates < 1:
+            raise ValueError("RETRIEVAL_PATIENT_CANDIDATES 必须 >= 1")
+        if self.day_candidates_per_query < 1:
+            raise ValueError("RETRIEVAL_DAY_CANDIDATES_PER_QUERY_DAY 必须 >= 1")
 
 
 # ═══════════════════════════════════════════════════════════════════
