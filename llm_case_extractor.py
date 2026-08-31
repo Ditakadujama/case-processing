@@ -19,6 +19,14 @@ from typing import List, Dict, Optional, Tuple, Set
 logger = logging.getLogger(__name__)
 
 
+def _direct_urlopen(request, timeout):
+    """发起不读取任何系统代理配置的 urllib 请求。"""
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=timeout)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 配置
 # ═══════════════════════════════════════════════════════════════════
@@ -721,6 +729,11 @@ class LLMCaseExtractor:
             ],
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
+            # Qwen/DeepSeek-compatible serving stacks read this option from
+            # chat_template_kwargs; a top-level enable_thinking flag may be ignored.
+            "chat_template_kwargs": {
+                "enable_thinking": self.config.enable_thinking,
+            },
         }
         if self.config.response_format_json:
             payload_dict["response_format"] = {"type": "json_object"}
@@ -733,7 +746,7 @@ class LLMCaseExtractor:
                 req.add_header("Content-Type", "application/json")
                 req.add_header("Authorization", f"Bearer {self.config.api_key}")
 
-                with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
+                with _direct_urlopen(req, timeout=self.config.timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
 
                 choices = body.get("choices")

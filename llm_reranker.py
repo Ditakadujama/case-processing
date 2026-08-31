@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from config import LLMConfig, RerankerConfig
 from llm_case_extractor import LLMCaseExtractor
+from llm_case_extractor import _direct_urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +197,7 @@ class HTTPReranker:
         req.add_header("Content-Type", "application/json")
         if self.config.api_key:
             req.add_header("Authorization", f"Bearer {self.config.api_key}")
-        with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
+        with _direct_urlopen(req, timeout=self.config.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
 

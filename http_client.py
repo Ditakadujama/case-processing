@@ -52,6 +52,9 @@ class HTTPClient:
             timeout=httpx.Timeout(connect_timeout, read=read_timeout),
             limits=limits,
             headers=headers,
+            # 校内模型/Embedding 服务必须直连，禁止读取 HTTP_PROXY、
+            # HTTPS_PROXY、ALL_PROXY 等环境变量。
+            trust_env=False,
         )
 
     def post_json(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:

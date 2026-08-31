@@ -88,7 +88,8 @@ def build_index(skip_existing: bool = True,
                 limit: int = 0,
                 llm_workers: int = 5,
                 llm_interval: float = 1.0,
-                rebuild_all: bool = False) -> None:
+                rebuild_all: bool = False,
+                progress_every: int = 1) -> None:
     """从 medical_records 构建医生关注文本的天级索引。"""
     print("=" * 60)
     print("构建天级索引 (医生关注文本 + LLM 日病例卡 + Embedding)")
@@ -191,8 +192,18 @@ def build_index(skip_existing: bool = True,
     print(f"准备构建 {len(day_records)} 条天级记录，来自 {len(set(d.patient_id for d in day_records))} 个患者")
 
     batch_size = 200
+    build_started = time.time()
+    total_records = len(day_records)
+    total_batches = (total_records + batch_size - 1) // batch_size
     for start in range(0, len(day_records), batch_size):
         batch = day_records[start:start + batch_size]
+        batch_number = start // batch_size + 1
+        batch_end = min(start + len(batch), total_records)
+        print(
+            f"\n[批次 {batch_number}/{total_batches}] 开始处理 "
+            f"{start + 1}-{batch_end}/{total_records}",
+            flush=True,
+        )
         _insert_day_texts(day_store, batch)
         _extract_day_case_cards_batch(
             batch,
@@ -202,9 +213,19 @@ def build_index(skip_existing: bool = True,
             actions={day.day_record_id: actions_by_id[day.day_record_id] for day in batch},
             llm_workers=llm_workers,
             llm_interval=llm_interval,
+            progress_every=progress_every,
         )
         done = min(start + batch_size, len(day_records))
-        print(f"  [{done}/{len(day_records)}] 天级记录已处理 ({done * 100 // len(day_records)}%)")
+        elapsed = max(time.time() - build_started, 0.001)
+        rate_per_minute = done / elapsed * 60
+        remaining = max(total_records - done, 0)
+        eta_seconds = remaining / (done / elapsed) if done else 0
+        print(
+            f"  总进度 {_progress_bar(done, total_records)} "
+            f"{done}/{total_records} | 平均 {rate_per_minute:.1f} 条/分钟 | "
+            f"预计剩余 {_format_duration(eta_seconds)}",
+            flush=True,
+        )
 
     stats = llm_extractor.get_stats()
     emb_stats = emb_service.get_stats()
@@ -242,7 +263,8 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
                                   day_store: MySQLDayStore,
                                   actions: dict[str, str],
                                   llm_workers: int = 5,
-                                  llm_interval: float = 1.0) -> None:
+                                  llm_interval: float = 1.0,
+                                  progress_every: int = 1) -> None:
     """抽取病例卡后批量生成 embedding，并批量事务写入。"""
     if not day_records:
         return
@@ -290,13 +312,25 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
     failures: list[ProcessingFailure] = []
 
     if extract_days:
+        llm_started = time.time()
+        llm_completed = 0
+        llm_succeeded = 0
+        llm_failed = 0
+        print(
+            f"  LLM 抽取开始：{len(extract_days)} 条，workers={max(1, llm_workers)}，"
+            f"请求间隔={min_interval:g}s",
+            flush=True,
+        )
         with ThreadPoolExecutor(max_workers=max(1, llm_workers)) as executor:
             futures = {executor.submit(extract_one, day): day for day in extract_days}
             for future in as_completed(futures):
                 day, card, error = future.result()
+                llm_completed += 1
                 if card is not None:
+                    llm_succeeded += 1
                     cards_by_id[day.day_record_id] = card
                 else:
+                    llm_failed += 1
                     logger.warning("[%s] 天级病例卡抽取失败: %s", day.day_record_id, error)
                     failures.append(ProcessingFailure(
                         day_record_id=day.day_record_id,
@@ -308,6 +342,25 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
                         extractor_version=DEFAULT_DAY_EXTRACTOR_VERSION,
                         embedding_model=embedding_model,
                     ))
+                if (
+                    llm_completed == 1
+                    or llm_completed == len(extract_days)
+                    or llm_completed % max(1, progress_every) == 0
+                ):
+                    elapsed = max(time.time() - llm_started, 0.001)
+                    speed = llm_completed / elapsed * 60
+                    remaining = len(extract_days) - llm_completed
+                    eta_seconds = remaining / (llm_completed / elapsed)
+                    _print_progress(
+                        "LLM",
+                        llm_completed,
+                        len(extract_days),
+                        succeeded=llm_succeeded,
+                        failed=llm_failed,
+                        speed=speed,
+                        elapsed=elapsed,
+                        eta=eta_seconds,
+                    )
 
     if embed_only_days:
         existing = day_store.load_case_cards_by_ids(
@@ -350,6 +403,8 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
     vectors_by_position: dict[int, object] = {}
     embedding_errors: dict[int, str] = {}
     if embedding_texts:
+        print(f"  Embedding 开始：{len(embedding_texts)} 条", flush=True)
+        embedding_started = time.time()
         batch_result = emb_service.embed_batch(embedding_texts)
         for batch_index, position in enumerate(embedding_positions):
             vector = batch_result.vectors[batch_index]
@@ -359,6 +414,11 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
                 embedding_errors[position] = batch_result.errors.get(
                     batch_index, "Embedding 返回空向量"
                 )
+        print(
+            f"  Embedding 完成：成功 {len(vectors_by_position)}，"
+            f"失败 {len(embedding_errors)}，耗时 {_format_duration(time.time() - embedding_started)}",
+            flush=True,
+        )
 
     write_rows: list[DayCardWriteRow] = []
     for position, (day, card, embedding_text, embedding_hash) in enumerate(prepared):
@@ -390,6 +450,7 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
         else:
             stats["fail"] += 1
 
+    print(f"  数据库写入：{len(write_rows)} 条病例卡", flush=True)
     write_result = day_store.upsert_day_cards(write_rows)
     if write_result.fail_count:
         stats["success"] = max(0, stats["success"] - write_result.fail_count)
@@ -399,8 +460,54 @@ def _extract_day_case_cards_batch(day_records: list[ClinicalDayRecord],
 
     print(
         f"  病例卡批处理: 成功 {stats['success']}, "
-        f"仅重做 embedding {stats['embed_only']}, 失败 {stats['fail']}"
+        f"仅重做 embedding {stats['embed_only']}, 失败 {stats['fail']}",
+        flush=True,
     )
+
+
+def _progress_bar(completed: int, total: int, width: int = 28) -> str:
+    """构建一个固定宽度的 CLI 进度条。"""
+    total = max(total, 1)
+    completed = max(0, min(completed, total))
+    ratio = completed / total
+    filled = min(width, int(ratio * width))
+    if filled >= width:
+        body = "█" * width
+    else:
+        body = "█" * filled + "▏" + "·" * max(0, width - filled - 1)
+    return f"[{body}] {ratio * 100:5.1f}%"
+
+
+def _print_progress(label: str,
+                    completed: int,
+                    total: int,
+                    succeeded: int,
+                    failed: int,
+                    speed: float,
+                    elapsed: float,
+                    eta: float) -> None:
+    """在同一终端行刷新进度，完成时换行保留最终状态。"""
+    line = (
+        f"  {label} {_progress_bar(completed, total)} {completed}/{total} | "
+        f"成功 {succeeded} 失败 {failed} | {speed:.1f} 条/分钟 | "
+        f"已用 {_format_duration(elapsed)} | 剩余 {_format_duration(eta)}"
+    )
+    end = "\n" if completed >= total else "\r"
+    # ANSI 清除整行，避免后一次较短文本留下尾部字符。
+    sys.stdout.write("\r\033[2K" + line + end)
+    sys.stdout.flush()
+
+
+def _format_duration(seconds: float) -> str:
+    """将秒数格式化为适合 CLI 进度显示的短文本。"""
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}秒"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}分{seconds:02d}秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}小时{minutes:02d}分"
 
 
 def search(search_excel: str,
@@ -563,6 +670,8 @@ def main() -> None:
                         help="LLM 日病例卡抽取并行线程数")
     parser.add_argument("--llm-interval", type=float, default=1.0,
                         help="两次 LLM 请求的最小间隔秒数；10次/秒限速可设为 0.1")
+    parser.add_argument("--progress-every", type=int, default=1,
+                        help="每完成多少条 LLM 抽取刷新一次进度条（默认 1）")
     parser.add_argument("--daily-days", type=int, default=0,
                         help="天级比较天数：0=按查询病例全部已有天数比较；N>0=只比较前 N 天")
     parser.add_argument("--rerank-top-n", type=int, default=10,
@@ -591,6 +700,8 @@ def main() -> None:
         parser.error("--rerank-interval 不能小于 0")
     if args.candidate_pool_size < 5:
         parser.error("--candidate-pool-size 不能小于 5")
+    if args.progress_every < 1:
+        parser.error("--progress-every 不能小于 1")
 
     if args.build:
         build_index(
@@ -599,6 +710,7 @@ def main() -> None:
             llm_workers=args.llm_workers,
             llm_interval=args.llm_interval,
             rebuild_all=args.rebuild_all,
+            progress_every=args.progress_every,
         )
     else:
         search(

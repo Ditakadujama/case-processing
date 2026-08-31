@@ -125,6 +125,9 @@ class LLMConfig:
     model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "gpt-4o-mini"))
     max_tokens: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS", "4096")))
     temperature: float = 0.0
+    enable_thinking: bool = field(
+        default_factory=lambda: os.environ.get("LLM_ENABLE_THINKING", "0") == "1"
+    )
     timeout: int = field(default_factory=lambda: int(os.environ.get("LLM_TIMEOUT", "300")))
     max_retries: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_RETRIES", "3")))
     context_max_chars: int = field(default_factory=lambda: int(os.environ.get("LLM_CONTEXT_MAX_CHARS", "100000")))
